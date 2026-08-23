@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>/en</loc></url>
+  <url><loc>/ar</loc></url>
+  <url><loc>/en/destinations</loc></url>
+  <url><loc>/ar/destinations</loc></url>
+  <url><loc>/en/packages</loc></url>
+  <url><loc>/ar/packages</loc></url>
+  <url><loc>/en/plan-your-trip</loc></url>
+  <url><loc>/ar/plan-your-trip</loc></url>
+  <url><loc>/en/services</loc></url>
+  <url><loc>/ar/services</loc></url>
+  <url><loc>/en/about</loc></url>
+  <url><loc>/ar/about</loc></url>
+  <url><loc>/en/inspiration</loc></url>
+  <url><loc>/ar/inspiration</loc></url>
+  <url><loc>/en/contact</loc></url>
+  <url><loc>/ar/contact</loc></url>
+</urlset>

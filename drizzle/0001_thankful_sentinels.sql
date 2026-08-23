@@ -1,0 +1,22 @@
+ALTER TABLE `enquiries` ADD `whatsapp` varchar(40);--> statement-breakpoint
+ALTER TABLE `enquiries` ADD `destination` varchar(180);--> statement-breakpoint
+ALTER TABLE `enquiries` ADD `travellers` varchar(120);--> statement-breakpoint
+ALTER TABLE `enquiries` ADD `preferences` text;--> statement-breakpoint
+ALTER TABLE `enquiries` ADD `budget` varchar(120);--> statement-breakpoint
+ALTER TABLE `enquiries` ADD `language` enum('ar','en');--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `validFrom` timestamp;--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `validUntil` timestamp;--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `lastPriceUpdatedAt` timestamp;--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `primaryImageUrl` text;--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `imageGallery` json;--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `imageAltEn` varchar(240);--> statement-breakpoint
+ALTER TABLE `travelOffers` ADD `imageAltAr` varchar(240);--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `makkahNights` int;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `madinahNights` int;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `transportationEn` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `transportationAr` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `ziyaratEn` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `ziyaratAr` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `importantNotesEn` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `importantNotesAr` text;--> statement-breakpoint
+ALTER TABLE `umrahPrograms` ADD `lastUpdatedAt` timestamp;
