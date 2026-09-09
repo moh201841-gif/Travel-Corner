@@ -3,12 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { TrpcContext } from "./_core/context";
 
 const createEnquiryMock = vi.hoisted(() => vi.fn());
+const getPublicSettingsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./db", () => ({
   createEnquiry: createEnquiryMock,
   getPublicCampaigns: vi.fn(),
   getPublicOfferBySlug: vi.fn(),
-  getPublicSettings: vi.fn(),
+  getPublicSettings: getPublicSettingsMock,
   getPublicUmrahProgramBySlug: vi.fn(),
   listAdminOffers: vi.fn(),
   listPublicOffers: vi.fn(),
@@ -23,6 +24,13 @@ function createPublicContext(): TrpcContext {
 }
 
 describe("Travel Corner enquiry contract", () => {
+  it("returns a defined null settings value when no site settings record exists", async () => {
+    getPublicSettingsMock.mockResolvedValueOnce(null);
+    const caller = appRouter.createCaller(createPublicContext());
+
+    await expect(caller.travel.settings()).resolves.toBeNull();
+  });
+
   it("records a valid custom-trip enquiry through the persistence boundary", async () => {
     createEnquiryMock.mockResolvedValueOnce({ id: 42 });
     const caller = appRouter.createCaller(createPublicContext());

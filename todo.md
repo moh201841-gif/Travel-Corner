@@ -94,3 +94,9 @@
 - [ ] After approval, import only confirmed data into the existing CMS/database structure.
 - [ ] Verify public hotel packages, database-driven prices, Umrah programs, occupancy pricing, bilingual mapping, expiry handling, and CMS propagation.
 - [ ] Produce a concise Production Data Readiness Report without publishing.
+
+# Current Bug Fix
+
+- [x] Fix the public `travel.settings` query returning undefined when site settings are absent.
+- [x] Add regression coverage for a defined settings response and verify the homepage query.
+- [x] Run checks and save the verified bug-fix checkpoint.

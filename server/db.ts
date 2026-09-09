@@ -189,9 +189,9 @@ export async function getPublicCampaigns() {
 
 export async function getPublicSettings() {
   const db = await getDb();
-  if (!db) return undefined;
+  if (!db) return null;
   const rows = await db.select().from(siteSettings).limit(1);
-  return rows[0];
+  return rows[0] ?? null;
 }
 
 export type NewEnquiry = typeof enquiries.$inferInsert;
