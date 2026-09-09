@@ -86,3 +86,11 @@
 - [x] Add relevant internal links and a high-authority external travel-planning resource.
 - [x] Add the Apple touch icon markup and validate desktop and mobile presentation.
 - [x] Save and deliver the SEO-enhanced Travel Corner checkpoint.
+
+# Current Copy Data Import
+
+- [ ] Analyze supplied Travel Corner content and identify business data fields.
+- [ ] Prepare source-to-CMS DATA MAPPING REPORT for user approval.
+- [ ] After approval, import only confirmed data into the existing CMS/database structure.
+- [ ] Verify public hotel packages, database-driven prices, Umrah programs, occupancy pricing, bilingual mapping, expiry handling, and CMS propagation.
+- [ ] Produce a concise Production Data Readiness Report without publishing.
