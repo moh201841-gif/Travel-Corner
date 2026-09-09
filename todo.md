@@ -100,3 +100,12 @@
 - [x] Fix the public `travel.settings` query returning undefined when site settings are absent.
 - [x] Add regression coverage for a defined settings response and verify the homepage query.
 - [x] Run checks and save the verified bug-fix checkpoint.
+
+# Poster-Based Travel Data Migration
+
+- [x] Extract hotel, Umrah, and contact records from the supplied Travel Corner source posters only.
+- [x] Deduplicate identical Sharm source images and preserve source-image references without using posters as hotel primary images.
+- [x] Prepare a record-level mapping, confidence, conflict, and manual-verification report before import.
+- [ ] Import only approved and sufficiently clear records into the existing CMS/database structure.
+- [ ] Verify representative Sharm, Hurghada, and Umrah CMS-to-public data flows, temporary price propagation, and expiry handling without publishing.
+- [ ] Produce the final Production Data Migration Report.
