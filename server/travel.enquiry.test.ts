@@ -55,4 +55,76 @@ describe("Travel Corner enquiry contract", () => {
 
     expect(createEnquiryMock).toHaveBeenCalledTimes(callsBefore);
   });
+
+  it("accepts a contact enquiry whose optional fields arrive blank, and stores them as absent", async () => {
+    // The exact shape the contact form produced before D1: untouched inputs submitted as "".
+    createEnquiryMock.mockResolvedValueOnce({ id: 101 });
+    const caller = appRouter.createCaller(createPublicContext());
+
+    await expect(caller.travel.createEnquiry({
+      kind: "callback",
+      sourcePath: "/en/contact",
+      preferredContact: "phone",
+      name: "",
+      phone: "01000000000",
+      whatsapp: "",
+      email: "",
+      travellerNotes: "Please call me about Sharm El Sheikh.",
+    })).resolves.toEqual({ id: 101 });
+
+    const stored = createEnquiryMock.mock.calls.at(-1)?.[0];
+    expect(stored.phone).toBe("01000000000");
+    expect(stored.name).toBeUndefined();
+    expect(stored.email).toBeUndefined();
+    expect(stored.whatsapp).toBeUndefined();
+  });
+
+  it("accepts a WhatsApp-only enquiry from an offer page", async () => {
+    createEnquiryMock.mockResolvedValueOnce({ id: 102 });
+    const caller = appRouter.createCaller(createPublicContext());
+
+    await expect(caller.travel.createEnquiry({
+      kind: "hotel_offer",
+      offerId: 4,
+      preferredContact: "whatsapp",
+      phone: "",
+      whatsapp: "01036666387",
+      travellerNotes: "Interest: Sharks Bay Oasis",
+    })).resolves.toEqual({ id: 102 });
+
+    const stored = createEnquiryMock.mock.calls.at(-1)?.[0];
+    expect(stored.whatsapp).toBe("01036666387");
+    expect(stored.phone).toBeUndefined();
+  });
+
+  it("still rejects a genuinely malformed email rather than silently dropping it", async () => {
+    const caller = appRouter.createCaller(createPublicContext());
+    const callsBefore = createEnquiryMock.mock.calls.length;
+
+    await expect(caller.travel.createEnquiry({
+      kind: "callback",
+      email: "not-an-email",
+      phone: "01000000000",
+    })).rejects.toThrow();
+
+    expect(createEnquiryMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it("rejects a submission where every contact channel is present but blank", async () => {
+    // Reachable now that the contact form no longer marks name and email as browser-required.
+    const caller = appRouter.createCaller(createPublicContext());
+    const callsBefore = createEnquiryMock.mock.calls.length;
+
+    await expect(caller.travel.createEnquiry({
+      kind: "callback",
+      sourcePath: "/en/contact",
+      name: "",
+      phone: "",
+      whatsapp: "",
+      email: "",
+      travellerNotes: "Please get in touch.",
+    })).rejects.toThrow();
+
+    expect(createEnquiryMock).toHaveBeenCalledTimes(callsBefore);
+  });
 });

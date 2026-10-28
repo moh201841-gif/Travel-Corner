@@ -4,6 +4,12 @@ export const AXIOS_TIMEOUT_MS = 30_000;
 export const UNAUTHED_ERR_MSG = 'Please login (10001)';
 export const NOT_ADMIN_ERR_MSG = 'You do not have required permission (10002)';
 
+// Raised when the offer editor's single headline price cannot be applied because the package has
+// several price periods. Shared so the admin UI can recognise this one known business refusal and
+// show it verbatim, while every other server failure falls back to a generic message rather than
+// leaking raw database error text to the operator.
+export const MULTI_RATE_HEADLINE_PRICE_ERR_MSG = 'This package has more than one price period, so the headline price cannot be applied here. Use "Price periods & occupancy" to edit the intended period (10003)';
+
 // One-time nonce cookie that binds an OAuth login to the browser that started
 // it. The `__Host-` prefix forces the cookie host-only (Secure, Path=/, no
 // Domain), so a sibling *.manus.space site cannot plant a matching value in a

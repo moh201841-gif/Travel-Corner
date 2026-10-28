@@ -1,5 +1,7 @@
 import { and, asc, eq, gte, inArray, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG } from "@shared/const";
+import { hasCurrentRatePeriod, isOfferPubliclyVisible, isRatePeriodCurrent, isUmrahProgramPubliclyVisible, shouldAutoExpireOffer, shouldAutoExpireUmrahProgram } from "@shared/lifecycle";
 import { campaigns, enquiries, InsertUser, offerRatePeriods, siteSettings, travelOffers, umrahPrograms, umrahRateRows, users } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
@@ -94,18 +96,26 @@ async function applyPublicLifecycleRules(now = new Date()) {
   const db = await getDb();
   if (!db) return;
 
-  await db.update(umrahPrograms).set({ availability: "expired", isActive: false }).where(and(
+  // The SQL below narrows the candidate set; the shared predicate makes the final call, so the
+  // archive rule cannot drift from the visibility rule. Narrowing is safe in both directions:
+  // public reads independently apply isOfferPubliclyVisible / isUmrahProgramPubliclyVisible, so a
+  // record this rule declines to archive is still never shown to a customer.
+  const umrahCandidates = await db.select({ id: umrahPrograms.id, isActive: umrahPrograms.isActive, availability: umrahPrograms.availability, departureAt: umrahPrograms.departureAt }).from(umrahPrograms).where(and(
     lt(umrahPrograms.departureAt, now),
     ne(umrahPrograms.availability, "expired"),
     ne(umrahPrograms.availability, "hidden"),
   ));
+  const umrahToArchive = umrahCandidates.filter((program) => shouldAutoExpireUmrahProgram(program, now)).map((program) => program.id);
+  if (umrahToArchive.length) await db.update(umrahPrograms).set({ availability: "expired", isActive: false }).where(inArray(umrahPrograms.id, umrahToArchive));
 
-  await db.update(travelOffers).set({ availability: "expired", isActive: false }).where(and(
+  const offerCandidates = await db.select({ id: travelOffers.id, isActive: travelOffers.isActive, availability: travelOffers.availability, validUntil: travelOffers.validUntil }).from(travelOffers).where(and(
     lt(travelOffers.validUntil, now),
     ne(travelOffers.availability, "expired"),
     ne(travelOffers.availability, "hidden"),
     ne(travelOffers.availability, "sold_out"),
   ));
+  const offersToArchive = offerCandidates.filter((offer) => shouldAutoExpireOffer(offer, now)).map((offer) => offer.id);
+  if (offersToArchive.length) await db.update(travelOffers).set({ availability: "expired", isActive: false }).where(inArray(travelOffers.id, offersToArchive));
 }
 
 function currentOfferVisibility(now: Date) {
@@ -132,6 +142,8 @@ export async function listPublicOffers(filters: { destination?: string; tag?: st
   await applyPublicLifecycleRules(now);
   const rows = await db.select().from(travelOffers).where(currentOfferVisibility(now)).orderBy(asc(travelOffers.destinationEn), asc(travelOffers.hotelNameEn));
   const selected = rows.filter((offer) => {
+    // Defence in depth: the SQL WHERE above is a pre-filter, the shared predicate is authoritative.
+    if (!isOfferPubliclyVisible(offer, now)) return false;
     const tags = Array.isArray(offer.hotelTags) ? offer.hotelTags.map(String) : [];
     if (filters.destination && offer.destinationEn.toLowerCase() !== filters.destination.toLowerCase() && offer.destinationAr !== filters.destination) return false;
     if (filters.tag && !tags.includes(filters.tag)) return false;
@@ -141,7 +153,8 @@ export async function listPublicOffers(filters: { destination?: string; tag?: st
   });
   if (selected.length === 0) return [];
   const rates = await db.select().from(offerRatePeriods).where(and(inArray(offerRatePeriods.offerId, selected.map((item) => item.id)), currentRateVisibility(now))).orderBy(asc(offerRatePeriods.price));
-  return selected.map((offer) => ({ ...offer, rates: rates.filter((rate) => rate.offerId === offer.id) })).filter((offer) => offer.rates.length > 0);
+  const currentRates = rates.filter((rate) => isRatePeriodCurrent(rate, now));
+  return selected.map((offer) => ({ ...offer, rates: currentRates.filter((rate) => rate.offerId === offer.id) })).filter((offer) => hasCurrentRatePeriod(offer.rates, now));
 }
 
 /** Retrieve a detailed hotel offer and all time-windowed price rows by its stable public slug. */
@@ -152,9 +165,9 @@ export async function getPublicOfferBySlug(slug: string) {
   await applyPublicLifecycleRules(now);
   const rows = await db.select().from(travelOffers).where(and(eq(travelOffers.slug, slug), currentOfferVisibility(now))).limit(1);
   const offer = rows[0];
-  if (!offer) return undefined;
+  if (!offer || !isOfferPubliclyVisible(offer, now)) return undefined;
   const rates = await db.select().from(offerRatePeriods).where(and(eq(offerRatePeriods.offerId, offer.id), currentRateVisibility(now))).orderBy(asc(offerRatePeriods.validFrom), asc(offerRatePeriods.price));
-  return { ...offer, rates };
+  return { ...offer, rates: rates.filter((rate) => isRatePeriodCurrent(rate, now)) };
 }
 
 /** The public Umrah listing is separate from leisure travel to retain its distinct product structure. */
@@ -163,7 +176,8 @@ export async function listPublicUmrahPrograms() {
   if (!db) return [];
   const now = new Date();
   await applyPublicLifecycleRules(now);
-  const programs = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).orderBy(asc(umrahPrograms.departureAt));
+  const rows = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).orderBy(asc(umrahPrograms.departureAt));
+  const programs = rows.filter((program) => isUmrahProgramPubliclyVisible(program, now));
   if (programs.length === 0) return [];
   const rates = await db.select().from(umrahRateRows).where(inArray(umrahRateRows.programId, programs.map((item) => item.id))).orderBy(asc(umrahRateRows.price));
   return programs.map((program) => ({ ...program, rates: rates.filter((rate) => rate.programId === program.id) }));
@@ -176,7 +190,7 @@ export async function getPublicUmrahProgramBySlug(slug: string) {
   await applyPublicLifecycleRules(now);
   const programs = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.slug, slug), eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).limit(1);
   const program = programs[0];
-  if (!program) return undefined;
+  if (!program || !isUmrahProgramPubliclyVisible(program, now)) return undefined;
   const rates = await db.select().from(umrahRateRows).where(eq(umrahRateRows.programId, program.id)).orderBy(asc(umrahRateRows.price));
   return { ...program, rates };
 }
@@ -216,20 +230,44 @@ export async function listAdminOffers() {
 
 export type AdminOfferInput = { id?: number; slug: string; destinationEn: string; destinationAr: string; hotelNameEn: string; hotelNameAr: string; areaEn?: string; areaAr?: string; days: number; nights: number; mealPlanEn: string; mealPlanAr: string; transportationIncluded: boolean; availability: "available" | "limited" | "on_request" | "sold_out" | "expired" | "hidden"; isActive: boolean; validUntil?: Date; price?: string; priceLabelEn?: string; priceLabelAr?: string };
 
-/** Create or update a hotel package and retain one editable headline rate for no-code staff operations. */
+/**
+ * Create or update a hotel package and maintain a single headline rate for no-code staff operations.
+ *
+ * Headline-price rules (D9):
+ *   0 rate rows → create exactly one
+ *   1 rate row  → update that row
+ *   2+ rate rows → refuse, because any choice would be a guess
+ *
+ * The previous implementation selected a row with an unordered `LIMIT 1`, which MySQL does not
+ * guarantee to be stable, so editing an offer could silently rewrite an arbitrary seasonal rate.
+ *
+ * Offer validity and rate validity are separate concepts: this function never writes
+ * validFrom/validUntil on a rate row. Rate windows are owned exclusively by the rate editor.
+ */
 export async function saveAdminOffer(input: AdminOfferInput) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
+
+  // Validate before writing anything, so a refusal never leaves the offer updated and the price not.
+  let existingRateIds: number[] = [];
+  if (input.id && input.price) {
+    const existingRates = await db.select({ id: offerRatePeriods.id }).from(offerRatePeriods).where(eq(offerRatePeriods.offerId, input.id));
+    if (existingRates.length > 1) throw new Error(MULTI_RATE_HEADLINE_PRICE_ERR_MSG);
+    existingRateIds = existingRates.map((rate) => rate.id);
+  }
+
   const patch = { slug: input.slug, destinationEn: input.destinationEn, destinationAr: input.destinationAr, hotelNameEn: input.hotelNameEn, hotelNameAr: input.hotelNameAr, areaEn: input.areaEn || null, areaAr: input.areaAr || null, days: input.days, nights: input.nights, mealPlanEn: input.mealPlanEn, mealPlanAr: input.mealPlanAr, transportationIncluded: input.transportationIncluded, availability: input.availability, isActive: input.isActive, validUntil: input.validUntil ?? null, lastPriceUpdatedAt: new Date() };
   const insertedOffer = input.id ? null : await db.insert(travelOffers).values(patch);
   const id = input.id ?? Number((insertedOffer as unknown as Array<{ insertId: number }>)[0]?.insertId);
   if (input.id) await db.update(travelOffers).set(patch).where(eq(travelOffers.id, input.id));
+
   if (input.price) {
-    const existing = await db.select().from(offerRatePeriods).where(eq(offerRatePeriods.offerId, id)).limit(1);
-    const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, validUntil: input.validUntil ?? null, lastUpdatedAt: new Date() };
-    if (existing[0]) await db.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, existing[0].id));
+    const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, lastUpdatedAt: new Date() };
+    const targetRateId = existingRateIds[0];
+    if (targetRateId !== undefined) await db.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, targetRateId));
     else await db.insert(offerRatePeriods).values({ offerId: id, occupancy: "per_person", currency: "EGP", ...ratePatch });
   }
+
   return { id };
 }
 
