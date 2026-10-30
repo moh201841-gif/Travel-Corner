@@ -253,32 +253,46 @@ export type AdminOfferInput = { id?: number; slug: string; destinationEn: string
  *
  * Offer validity and rate validity are separate concepts: this function never writes
  * validFrom/validUntil on a rate row. Rate windows are owned exclusively by the rate editor.
+ *
+ * The offer write and the headline-rate write are one transaction, so a failure part-way through can
+ * no longer leave the offer updated while its price is not — a state that also stamped
+ * lastPriceUpdatedAt as though the price had been written, and so concealed itself. The D9 read sits
+ * inside the transaction so the rows it counts are the rows the write acts on.
+ *
+ * Scope limit, deliberately stated: the transaction makes this operation all-or-nothing. It does NOT
+ * prevent a concurrent replaceOfferRates from inserting rate rows between the D9 read and the rate
+ * write, so the D9 refusal remains bypassable under concurrent admin edits. Closing that race needs
+ * a locking or isolation strategy whose behaviour on TiDB is unverified; it is registered as deferred
+ * coverage in server/lifecycle.integration.test.ts rather than guessed at here.
  */
 export async function saveAdminOffer(input: AdminOfferInput) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
 
-  // Validate before writing anything, so a refusal never leaves the offer updated and the price not.
-  let existingRateIds: number[] = [];
-  if (input.id && input.price) {
-    const existingRates = await db.select({ id: offerRatePeriods.id }).from(offerRatePeriods).where(eq(offerRatePeriods.offerId, input.id));
-    if (existingRates.length > 1) throw new Error(MULTI_RATE_HEADLINE_PRICE_ERR_MSG);
-    existingRateIds = existingRates.map((rate) => rate.id);
-  }
+  return db.transaction(async (tx) => {
+    // Counted inside the transaction so a refusal reflects the rows this write would act on, and so
+    // a refusal rolls back rather than relying on being reached before the first write.
+    let existingRateIds: number[] = [];
+    if (input.id && input.price) {
+      const existingRates = await tx.select({ id: offerRatePeriods.id }).from(offerRatePeriods).where(eq(offerRatePeriods.offerId, input.id));
+      if (existingRates.length > 1) throw new Error(MULTI_RATE_HEADLINE_PRICE_ERR_MSG);
+      existingRateIds = existingRates.map((rate) => rate.id);
+    }
 
-  const patch = { slug: input.slug, destinationEn: input.destinationEn, destinationAr: input.destinationAr, hotelNameEn: input.hotelNameEn, hotelNameAr: input.hotelNameAr, areaEn: input.areaEn || null, areaAr: input.areaAr || null, days: input.days, nights: input.nights, mealPlanEn: input.mealPlanEn, mealPlanAr: input.mealPlanAr, transportationIncluded: input.transportationIncluded, availability: input.availability, isActive: input.isActive, validUntil: input.validUntil ?? null, lastPriceUpdatedAt: new Date() };
-  const insertedOffer = input.id ? null : await db.insert(travelOffers).values(patch);
-  const id = input.id ?? Number((insertedOffer as unknown as Array<{ insertId: number }>)[0]?.insertId);
-  if (input.id) await db.update(travelOffers).set(patch).where(eq(travelOffers.id, input.id));
+    const patch = { slug: input.slug, destinationEn: input.destinationEn, destinationAr: input.destinationAr, hotelNameEn: input.hotelNameEn, hotelNameAr: input.hotelNameAr, areaEn: input.areaEn || null, areaAr: input.areaAr || null, days: input.days, nights: input.nights, mealPlanEn: input.mealPlanEn, mealPlanAr: input.mealPlanAr, transportationIncluded: input.transportationIncluded, availability: input.availability, isActive: input.isActive, validUntil: input.validUntil ?? null, lastPriceUpdatedAt: new Date() };
+    const insertedOffer = input.id ? null : await tx.insert(travelOffers).values(patch);
+    const id = input.id ?? Number((insertedOffer as unknown as Array<{ insertId: number }>)[0]?.insertId);
+    if (input.id) await tx.update(travelOffers).set(patch).where(eq(travelOffers.id, input.id));
 
-  if (input.price) {
-    const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, lastUpdatedAt: new Date() };
-    const targetRateId = existingRateIds[0];
-    if (targetRateId !== undefined) await db.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, targetRateId));
-    else await db.insert(offerRatePeriods).values({ offerId: id, occupancy: "per_person", currency: "EGP", ...ratePatch });
-  }
+    if (input.price) {
+      const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, lastUpdatedAt: new Date() };
+      const targetRateId = existingRateIds[0];
+      if (targetRateId !== undefined) await tx.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, targetRateId));
+      else await tx.insert(offerRatePeriods).values({ offerId: id, occupancy: "per_person", currency: "EGP", ...ratePatch });
+    }
 
-  return { id };
+    return { id };
+  });
 }
 
 export async function updateOfferStatus(id: number, patch: Pick<typeof travelOffers.$inferInsert, "isActive" | "availability">) {

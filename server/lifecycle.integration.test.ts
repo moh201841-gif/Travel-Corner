@@ -24,8 +24,20 @@ const BLOCKED_COVERAGE = [
   "SQL visibility clauses in db.ts conform to the shared lifecycle predicates over seeded fixtures",
   "applyPublicLifecycleRules archives exactly the passed rows and leaves hidden/sold_out untouched",
   "listPublicOffers omits an offer whose rate windows have all closed",
+  "getPublicOfferBySlug withholds an offer whose rate windows have all closed (Finding 1)",
   "saveAdminOffer headline-price rules: 0 rows creates, 1 row updates, 2+ rows is refused (D9)",
   "saveAdminOffer never writes validFrom/validUntil on a rate row (K-2 separation)",
+  // Finding 2 — saveAdminOffer atomicity. The transaction boundary is implemented in server/db.ts
+  // and covered by mocked delegation tests in server/saveAdminOffer.transaction.test.ts. Those tests
+  // prove the code hands every operation to the transaction and lets failures propagate; they cannot
+  // prove the database discards the offer write. Only the entries below can, against a real server.
+  "saveAdminOffer create path: a failing rate INSERT leaves no travelOffers row behind (Finding 2)",
+  "saveAdminOffer edit path: a failing rate UPDATE leaves the offer row byte-identical, lastPriceUpdatedAt included (Finding 2)",
+  "saveAdminOffer edit path with zero rates: a failing rate INSERT leaves the offer unchanged and no rate row (Finding 2)",
+  "saveAdminOffer D9 refusal on a multi-rate offer leaves every offer and rate row unchanged (Finding 2)",
+  "saveAdminOffer success commits the offer and its headline rate together, and the returned id resolves (Finding 2)",
+  "saveAdminOffer leaves validFrom/validUntil on the touched rate row untouched on both the success and the rollback path (Finding 2)",
+  "saveAdminOffer versus a concurrent replaceOfferRates: the D9 refusal is not bypassed and no rate row is overwritten arbitrarily (Finding 2 — concurrency; a transaction alone does not close this race, and the required locking semantics are unverified on TiDB)",
   "replaceOfferRates rolls back completely on a mid-operation failure (D6 — blocked)",
   "replaceUmrahRates rolls back completely on a mid-operation failure (D7 — blocked)",
   "rate reconciliation preserves childPrice, infantPrice and bilingual notes (D8 — blocked)",
