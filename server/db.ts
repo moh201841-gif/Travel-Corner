@@ -157,7 +157,15 @@ export async function listPublicOffers(filters: { destination?: string; tag?: st
   return selected.map((offer) => ({ ...offer, rates: currentRates.filter((rate) => rate.offerId === offer.id) })).filter((offer) => hasCurrentRatePeriod(offer.rates, now));
 }
 
-/** Retrieve a detailed hotel offer and all time-windowed price rows by its stable public slug. */
+/**
+ * Retrieve a detailed hotel offer and its currently valid price rows by its stable public slug.
+ *
+ * An offer carrying no current rate period is not bookable, so it is withheld here exactly as
+ * listPublicOffers withholds it from the listing. Both paths therefore answer the same question with
+ * the same rule. Without this, an offer whose rate windows had all closed stayed reachable by direct
+ * link with an empty rates array: a priced product presented with no price, still accepting
+ * enquiries.
+ */
 export async function getPublicOfferBySlug(slug: string) {
   const db = await getDb();
   if (!db) return undefined;
@@ -167,7 +175,9 @@ export async function getPublicOfferBySlug(slug: string) {
   const offer = rows[0];
   if (!offer || !isOfferPubliclyVisible(offer, now)) return undefined;
   const rates = await db.select().from(offerRatePeriods).where(and(eq(offerRatePeriods.offerId, offer.id), currentRateVisibility(now))).orderBy(asc(offerRatePeriods.validFrom), asc(offerRatePeriods.price));
-  return { ...offer, rates: rates.filter((rate) => isRatePeriodCurrent(rate, now)) };
+  const currentRates = rates.filter((rate) => isRatePeriodCurrent(rate, now));
+  if (!hasCurrentRatePeriod(currentRates, now)) return undefined;
+  return { ...offer, rates: currentRates };
 }
 
 /** The public Umrah listing is separate from leisure travel to retain its distinct product structure. */
