@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { appRouter } from "./routers";
 import { COOKIE_NAME } from "../shared/const";
+import { ENV } from "./_core/env";
 import type { TrpcContext } from "./_core/context";
 
 type CookieCall = {
@@ -51,12 +52,16 @@ describe("auth.logout", () => {
     expect(result).toEqual({ success: true });
     expect(clearedCookies).toHaveLength(1);
     expect(clearedCookies[0]?.name).toBe(COOKIE_NAME);
+    // A browser only deletes a cookie when the attributes match the ones it was set with, so this
+    // has to track the configured SameSite policy rather than a fixed value. Independent hosting
+    // defaults to "lax"; Manus needed "none" because it embedded the app cross-site.
     expect(clearedCookies[0]?.options).toMatchObject({
       maxAge: -1,
       secure: true,
-      sameSite: "none",
+      sameSite: ENV.sessionCookieSameSite,
       httpOnly: true,
       path: "/",
     });
+    expect(ENV.sessionCookieSameSite).toBe(process.env.SESSION_COOKIE_SAMESITE ?? "lax");
   });
 });

@@ -3,15 +3,28 @@ import { drizzle } from "drizzle-orm/mysql2";
 import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG, MULTI_RATE_UMRAH_PRICE_ERR_MSG } from "@shared/const";
 import { hasCurrentRatePeriod, isOfferPubliclyVisible, isRatePeriodCurrent, isUmrahProgramPubliclyVisible, shouldAutoExpireOffer, shouldAutoExpireUmrahProgram } from "@shared/lifecycle";
 import { campaigns, enquiries, InsertUser, offerRatePeriods, siteSettings, travelOffers, umrahPrograms, umrahRateRows, users } from "../drizzle/schema";
+import { databaseConnectionOptions } from "./databaseSsl";
 import { ENV } from './_core/env';
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
+/**
+ * Lazily create the drizzle instance so local tooling can run without a DB.
+ *
+ * The connection goes in as an object rather than a bare URL string: drizzle(string) builds its pool
+ * as createPool({ uri }) with no way to supply TLS options, and a managed MySQL such as Aiven needs
+ * its CA certificate passed as PEM content. databaseConnectionOptions returns exactly { uri } when
+ * no CA is configured, so local development and the loopback integration harness are unchanged.
+ *
+ * A configuration fault — an unreadable or invalid CA, or an SSL query parameter mysql2 would ignore
+ * — throws out of here rather than being swallowed, because the alternative is an unverified or
+ * plaintext connection. The catch below stays for genuine pool-construction failures only.
+ */
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
+    const connection = databaseConnectionOptions(process.env.DATABASE_URL);
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      _db = drizzle({ connection });
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;

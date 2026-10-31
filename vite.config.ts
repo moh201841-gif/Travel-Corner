@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+import { hasUnresolvedAnalyticsPlaceholder, stripUnconfiguredAnalytics } from "./shared/analyticsHtml";
 
 // =============================================================================
 // Manus Debug Collector - Vite Plugin
@@ -150,7 +151,28 @@ function vitePluginManusDebugCollector(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+/**
+ * Drop the optional analytics tag when its variables are not set.
+ *
+ * Runs after Vite's own `%VAR%` substitution, so a placeholder that is still present was never
+ * configured. Setting VITE_ANALYTICS_ENDPOINT and VITE_ANALYTICS_WEBSITE_ID leaves nothing to
+ * match, and the tag ships as before.
+ */
+function vitePluginStripUnconfiguredAnalytics(): Plugin {
+  return {
+    name: "travel-corner-strip-unconfigured-analytics",
+    transformIndexHtml: {
+      order: "post",
+      handler(html) {
+        if (!hasUnresolvedAnalyticsPlaceholder(html)) return html;
+        console.log("[analytics] not configured; removing the analytics tag from index.html");
+        return stripUnconfiguredAnalytics(html);
+      },
+    },
+  };
+}
+
+const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector(), vitePluginStripUnconfiguredAnalytics()];
 
 export default defineConfig({
   plugins,

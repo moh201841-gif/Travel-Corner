@@ -7,7 +7,10 @@ import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
-import { serveStatic, setupVite } from "./vite";
+import { registerAdminAuthRoutes } from "./adminAuth";
+import { parsePort, shouldScanForPort } from "./port";
+import { assertDatabaseTlsConfiguration } from "../databaseSsl";
+import { serveStatic } from "./serveStatic";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -36,6 +39,9 @@ async function startServer() {
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
+  // Independent single-administrator login. Registered next to the OAuth routes so both identity
+  // paths share the same session cookie and the same adminProcedure authorization gate.
+  registerAdminAuthRoutes(app);
   // tRPC API
   app.use(
     "/api/trpc",
@@ -44,25 +50,20 @@ async function startServer() {
       createContext,
     })
   );
-  // development mode uses Vite, production mode uses static files
+  // development mode uses Vite, production mode uses static files.
+  // ./vite is imported dynamically so the production bundle never loads `vite` or the dev-only
+  // plugins, and can therefore run from a production-only dependency install.
   if (process.env.NODE_ENV === "development") {
+    const { setupVite } = await import("./vite");
     await setupVite(app, server);
   } else {
     serveStatic(app);
   }
 
-  const isProduction = process.env.NODE_ENV === "production";
-  const preferredPort = parseInt(process.env.PORT || "3000");
-
-  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) {
-    throw new Error(`PORT is not a valid port number: ${JSON.stringify(process.env.PORT)}`);
-  }
-
-  // A hosting platform assigns PORT and health-checks exactly that port. Scanning for an alternative
-  // would bind one the platform never probes, which surfaces as an opaque "port scan timeout" rather
-  // than a clear error — so in production bind PORT or fail loudly. The scan stays in development,
-  // where several instances may run side by side.
-  const port = isProduction ? preferredPort : await findAvailablePort(preferredPort);
+  const preferredPort = parsePort(process.env.PORT);
+  const port = shouldScanForPort(process.env.NODE_ENV)
+    ? await findAvailablePort(preferredPort)
+    : preferredPort;
 
   if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
@@ -72,5 +73,11 @@ async function startServer() {
     console.log(`Server running on port ${port}`);
   });
 }
+
+// Fail the deploy, not individual requests: the database pool is built lazily and the health check
+// path is static, so a bad CA — or an SSL parameter the driver would ignore and downgrade to
+// plaintext — must stop the process here. Deliberately outside startServer(), because the catch
+// below reports an error and still exits 0, which would look like a clean start to the host.
+assertDatabaseTlsConfiguration();
 
 startServer().catch(console.error);

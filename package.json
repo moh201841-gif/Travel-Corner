@@ -3,14 +3,19 @@
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "NODE_ENV=development tsx watch server/_core/index.ts",
-    "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --splitting --outdir=dist --chunk-names=[name]",
     "start": "NODE_ENV=production node dist/index.js",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",
     "test:integration": "TRAVEL_CORNER_REQUIRE_DB=1 vitest run server/lifecycle.integration.test.ts -t \"Finding 2 atomicity\"",
+    "db:migrate": "drizzle-kit migrate",
+    "admin:hash": "tsx scripts/hash-admin-password.ts",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"
   },
   "dependencies": {

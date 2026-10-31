@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { adminProcedure, publicProcedure, router } from "../_core/trpc";
 import { createEnquiry, getPublicCampaigns, getPublicOfferBySlug, getPublicSettings, getPublicUmrahProgramBySlug, listAdminOffers, listAdminUmrahPrograms, listPublicOffers, listPublicUmrahPrograms, replaceOfferRates, replaceUmrahRates, saveAdminOffer, saveAdminUmrahProgram, updateOfferMedia, updateOfferStatus, updateUmrahStatus } from "../db";
-import { storagePut } from "../storage";
+import { MAX_MEDIA_BYTES, offerImageKey, putMedia, type MediaContentType } from "../_core/mediaStorage";
 
 const availabilityValues = ["available", "limited", "on_request", "sold_out", "expired", "hidden"] as const;
 
@@ -55,12 +55,20 @@ export const travelRouter = router({
     replaceUmrahRates: adminProcedure.input(z.object({ programId: z.number().int().positive(), rates: z.array(adminUmrahRateSchema).min(1).max(8) })).mutation(({ input }) => replaceUmrahRates(input.programId, input.rates)),
     updateOfferStatus: adminProcedure.input(z.object({ id: z.number().int().positive(), isActive: z.boolean().optional(), availability: z.enum(availabilityValues).optional() }).refine((data) => data.isActive !== undefined || data.availability !== undefined, { message: "Choose at least one field to update." })).mutation(({ input }) => updateOfferStatus(input.id, { isActive: input.isActive, availability: input.availability })),
     updateOfferMedia: adminProcedure.input(z.object({ id: z.number().int().positive(), primaryImageUrl: z.string().max(1000).nullable().optional(), imageGallery: z.array(imageAssetSchema).max(12).optional(), imageAltEn: z.string().max(240).nullable().optional(), imageAltAr: z.string().max(240).nullable().optional() })).mutation(({ input }) => updateOfferMedia(input.id, { primaryImageUrl: input.primaryImageUrl, imageGallery: input.imageGallery, imageAltEn: input.imageAltEn, imageAltAr: input.imageAltAr })),
+    /**
+     * Administrator image upload. adminProcedure is the authorization gate, so an anonymous or
+     * non-admin caller never reaches the storage layer.
+     *
+     * `filename` stays in the contract because the dashboard sends it, but it is deliberately not
+     * used to build the storage key: the key comes from offerImageKey, which fixes the prefix
+     * server-side. putMedia then re-checks the size, the type and the bytes themselves.
+     */
     uploadOfferImage: adminProcedure.input(z.object({ offerId: z.number().int().positive(), filename: z.string().min(1).max(160), contentType: z.enum(["image/jpeg", "image/png", "image/webp"]), base64: z.string().min(32).max(7_000_000) })).mutation(async ({ input }) => {
       const rawBase64 = input.base64.replace(/^data:image\/(jpeg|png|webp);base64,/, "");
       const bytes = Buffer.from(rawBase64, "base64");
-      if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw new Error("Image must be a non-empty file up to 5 MB.");
-      const extension = input.contentType === "image/png" ? "png" : input.contentType === "image/webp" ? "webp" : "jpg";
-      const stored = await storagePut(`travel-corner/offers/${input.offerId}/${Date.now()}.${extension}`, bytes, input.contentType);
+      if (!bytes.length || bytes.length > MAX_MEDIA_BYTES) throw new Error(`Image must be a non-empty file up to ${Math.floor(MAX_MEDIA_BYTES / (1024 * 1024))} MB.`);
+      const contentType = input.contentType as MediaContentType;
+      const stored = await putMedia({ key: offerImageKey(input.offerId, contentType), bytes, contentType });
       return { url: stored.url };
     }),
     umrahPrograms: adminProcedure.query(() => listAdminUmrahPrograms()),
