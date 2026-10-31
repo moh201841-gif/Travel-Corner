@@ -28,7 +28,7 @@ import type { Express, Request, Response } from "express";
 import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 import * as db from "../db";
 import { getSessionCookieOptions } from "./cookies";
-import { ADMIN_HASH_SCHEME, hashAdminPassword, verifyAdminPassword } from "./passwordHash";
+import { ADMIN_HASH_SCHEME, adminHashFormatError, hashAdminPassword, verifyAdminPassword } from "./passwordHash";
 import { ENV } from "./env";
 import { sdk } from "./sdk";
 
@@ -36,7 +36,7 @@ import { sdk } from "./sdk";
  * Re-exported so the login route, the tests and `pnpm admin:hash` all name one hashing
  * implementation. The primitives themselves live in ./passwordHash.
  */
-export { ADMIN_HASH_SCHEME, hashAdminPassword, verifyAdminPassword };
+export { ADMIN_HASH_SCHEME, adminHashFormatError, hashAdminPassword, verifyAdminPassword };
 
 /** Failed attempts allowed per client before the login route refuses to check the password. */
 export const MAX_FAILED_ATTEMPTS = 5;
@@ -130,6 +130,12 @@ export function resetLoginRateLimit(): void {
 /** Configuration the login route needs before it can authenticate anybody. */
 export function adminLoginConfigError(): string | null {
   if (!ENV.adminPasswordHash) return "ADMIN_PASSWORD_HASH is not configured";
+  // A digest that cannot be parsed makes every password wrong, and the 401 that results is by
+  // design indistinguishable from a wrong password. Treating it as a configuration fault instead
+  // means the operator is told the login is misconfigured and the log says exactly how, rather than
+  // both of us concluding the password is wrong. The reason describes the digest's shape only.
+  const hashProblem = adminHashFormatError(ENV.adminPasswordHash);
+  if (hashProblem) return `ADMIN_PASSWORD_HASH is malformed: ${hashProblem}`;
   if (!ENV.cookieSecret) return "JWT_SECRET is not configured";
   if (!ENV.ownerOpenId) return "OWNER_OPEN_ID is not configured";
   // sdk.verifySession requires a non-empty appId in the session payload, so an unset VITE_APP_ID

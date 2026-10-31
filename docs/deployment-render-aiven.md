@@ -113,6 +113,30 @@ wherever you saved it; the path is not special.
 5. Sign in. A 200 with a `Set-Cookie` is the end-to-end proof: the password verified, the
    administrator row was written to Aiven over a verified TLS connection, read back as
    `role: "admin"`, and a session was issued.
+6. In the control room, open **Edit & images** on a package and save it. A success toast is the
+   proof the migrations are applied: the offer write touches `validUntil` and
+   `lastPriceUpdatedAt`, both added by migration `0001`, so a database carrying only `0000`
+   answers "The database schema is out of date".
+
+### Reading a sign-in failure
+
+| What you see | What it means |
+| --- | --- |
+| 503 "Administrator login is not configured" | A required variable is missing, **or** `ADMIN_PASSWORD_HASH` cannot be parsed. The log line names which — `ADMIN_PASSWORD_HASH is malformed: …` — and never prints the value |
+| 401 "Incorrect password" | The password does not match the configured digest. Each password belongs to one hash: if `pnpm admin:hash` was run more than once, the password and the deployed hash must come from the same run |
+| 429 "Too many attempts" | Five failures from this client. It clears after 15 minutes, or on a restart (the limiter is in-process) |
+
+Surrounding whitespace and one matching pair of quotes are stripped from `ADMIN_PASSWORD_HASH`,
+`OWNER_OPEN_ID` and `VITE_APP_ID`, because a paste into a dashboard field picks those up easily and
+every one of them used to produce a silent 401. `JWT_SECRET` is left exactly as configured.
+
+### Reading a save failure in the control room
+
+The dashboard shows the server's own message when there is one to show, so these are distinguishable
+without log access: a slug already in use, an out-of-date schema (apply the migrations), an
+unreachable database, unconfigured image storage, or a named form field with what is wrong with it.
+Anything else falls back to a generic sentence, with the full driver error in the service log —
+database text is never sent to the browser.
 
 To confirm the fail-closed path without touching the database, temporarily point `DATABASE_CA_PATH`
 at a file that does not exist: the service must exit non-zero rather than start, and the error names

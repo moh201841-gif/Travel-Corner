@@ -4,6 +4,7 @@ import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG, MULTI_RATE_UMRAH_PRICE_ERR_MSG } fro
 import { hasCurrentRatePeriod, isOfferPubliclyVisible, isRatePeriodCurrent, isUmrahProgramPubliclyVisible, shouldAutoExpireOffer, shouldAutoExpireUmrahProgram } from "@shared/lifecycle";
 import { campaigns, enquiries, InsertUser, offerRatePeriods, siteSettings, travelOffers, umrahPrograms, umrahRateRows, users } from "../drizzle/schema";
 import { databaseConnectionOptions } from "./databaseSsl";
+import { withOperatorSafeDbErrors } from "./dbErrors";
 import { ENV } from './_core/env';
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -282,7 +283,7 @@ export async function saveAdminOffer(input: AdminOfferInput) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
 
-  return db.transaction(async (tx) => {
+  return withOperatorSafeDbErrors("saveAdminOffer", () => db.transaction(async (tx) => {
     // Counted inside the transaction so a refusal reflects the rows this write would act on, and so
     // a refusal rolls back rather than relying on being reached before the first write.
     let existingRateIds: number[] = [];
@@ -305,13 +306,13 @@ export async function saveAdminOffer(input: AdminOfferInput) {
     }
 
     return { id };
-  });
+  }));
 }
 
 export async function updateOfferStatus(id: number, patch: Pick<typeof travelOffers.$inferInsert, "isActive" | "availability">) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
-  await db.update(travelOffers).set(patch).where(eq(travelOffers.id, id));
+  await withOperatorSafeDbErrors("updateOfferStatus", () => db.update(travelOffers).set(patch).where(eq(travelOffers.id, id)));
   return { success: true };
 }
 
@@ -319,7 +320,7 @@ export async function updateOfferStatus(id: number, patch: Pick<typeof travelOff
 export async function updateOfferMedia(id: number, patch: Pick<typeof travelOffers.$inferInsert, "primaryImageUrl" | "imageGallery" | "imageAltEn" | "imageAltAr">) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
-  await db.update(travelOffers).set(patch).where(eq(travelOffers.id, id));
+  await withOperatorSafeDbErrors("updateOfferMedia", () => db.update(travelOffers).set(patch).where(eq(travelOffers.id, id)));
   return { success: true };
 }
 
@@ -345,12 +346,12 @@ export async function replaceOfferRates(offerId: number, rates: AdminRateInput[]
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
 
-  return db.transaction(async (tx) => {
+  return withOperatorSafeDbErrors("replaceOfferRates", () => db.transaction(async (tx) => {
     await tx.delete(offerRatePeriods).where(eq(offerRatePeriods.offerId, offerId));
     if (rates.length) await tx.insert(offerRatePeriods).values(rates.map((rate) => ({ offerId, labelEn: rate.labelEn || null, labelAr: rate.labelAr || null, occupancy: rate.occupancy, price: rate.price, currency: "EGP", childPrice: rate.childPrice || null, infantPrice: rate.infantPrice || null, validFrom: rate.validFrom ?? null, validUntil: rate.validUntil ?? null, notesEn: rate.notesEn || null, notesAr: rate.notesAr || null, lastUpdatedAt: new Date() })));
     await tx.update(travelOffers).set({ lastPriceUpdatedAt: new Date() }).where(eq(travelOffers.id, offerId));
     return { success: true };
-  });
+  }));
 }
 
 export async function listAdminUmrahPrograms() {
@@ -387,7 +388,7 @@ export async function saveAdminUmrahProgram(input: AdminUmrahInput) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
 
-  return db.transaction(async (tx) => {
+  return withOperatorSafeDbErrors("saveAdminUmrahProgram", () => db.transaction(async (tx) => {
     // Counted inside the transaction so a refusal reflects the rows this write would act on, and
     // targeted by explicit id afterwards rather than by an unordered LIMIT 1.
     let existingRateIds: number[] = [];
@@ -410,13 +411,13 @@ export async function saveAdminUmrahProgram(input: AdminUmrahInput) {
     }
 
     return { id };
-  });
+  }));
 }
 
 export async function updateUmrahStatus(id: number, patch: Pick<typeof umrahPrograms.$inferInsert, "isActive" | "availability">) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
-  await db.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, id));
+  await withOperatorSafeDbErrors("updateUmrahStatus", () => db.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, id)));
   return { success: true };
 }
 
@@ -439,10 +440,10 @@ export async function replaceUmrahRates(programId: number, rates: AdminUmrahRate
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
 
-  return db.transaction(async (tx) => {
+  return withOperatorSafeDbErrors("replaceUmrahRates", () => db.transaction(async (tx) => {
     await tx.delete(umrahRateRows).where(eq(umrahRateRows.programId, programId));
     if (rates.length) await tx.insert(umrahRateRows).values(rates.map((rate) => ({ programId, roomType: rate.roomType, price: rate.price, currency: "EGP", notesEn: rate.notesEn || null, notesAr: rate.notesAr || null })));
     await tx.update(umrahPrograms).set({ lastUpdatedAt: new Date() }).where(eq(umrahPrograms.id, programId));
     return { success: true };
-  });
+  }));
 }

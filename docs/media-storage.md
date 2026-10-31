@@ -16,7 +16,10 @@ Both paths are served by one handler in `server/_core/storageProxy.ts`:
 - **R2 configured** → the handler resolves from R2 and **never calls Manus Forge.**
 - **R2 not configured** → it falls back to Manus Forge, so a deployment still on Manus keeps
   working. Configuring R2 is what removes the Forge dependency.
-- **Neither configured** → `503`, naming the missing configuration in the server log only.
+- **Neither configured** → `503`, naming the missing configuration in the server log only. That
+  notice is printed **once per process**, not once per request: the nine static assets below are
+  still referenced under `/manus-storage/`, so per-request logging produced several identical lines
+  on every page load and buried everything else.
 
 With `R2_PUBLIC_BASE_URL` set, the handler redirects straight to that bucket domain. Without it the
 bucket is treated as private and the handler redirects to a signed `GET` valid for 15 minutes, so a
@@ -35,6 +38,21 @@ Uploads are refused before anything reaches the network unless **all** of the fo
 The storage key is built server-side by `offerImageKey()` as
 `travel-corner/offers/<offerId>/<timestamp>.<ext>`. The `filename` the dashboard sends is **not**
 used to build it.
+
+## Managing hotel images
+
+Cover image, gallery and the English/Arabic alt text are edited inside the hotel package form —
+**Edit & images** on a package row, or the form that stays open after you create one. A package
+carries one cover plus up to twelve gallery images; public cards fall back to the destination image
+while no cover is set.
+
+The key contains the package id, so there is nothing to upload against until the package row
+exists. Creating a package therefore leaves the form open on the saved package rather than closing
+it, and images are added in the same pass.
+
+With no R2 settings configured, the form says so and the upload buttons are disabled; alt text and
+the order of images already stored stay editable. An upload attempted anyway is refused by the
+router before the bytes are decoded, with a message that names no environment variable.
 
 ## One-time setup
 
