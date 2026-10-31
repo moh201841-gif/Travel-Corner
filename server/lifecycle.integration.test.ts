@@ -26,7 +26,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   closeApplicationPool,
   importApplicationDb,
+  rootCauseMessage,
   setupIntegrationDatabase,
+  SENTINEL_CONSTRAINT_NAME,
   SENTINEL_REJECTED_PRICE,
   type IntegrationDatabase,
 } from "./testDatabase";
@@ -166,6 +168,26 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
     );
   }
 
+  /**
+   * Assert the call rejected *because the sentinel CHECK constraint fired*, not for any other reason.
+   *
+   * Drizzle's thrown error only says "Failed query: <sql>", keeping the driver error on `.cause`, so
+   * matching the top-level message would pass for any failed write — including a schema mistake that
+   * never exercised rollback at all. Matching the root cause, and the constraint by name, makes the
+   * injected failure the only thing these tests can be satisfied by.
+   */
+  async function expectSentinelRejection(call: Promise<unknown>): Promise<void> {
+    const error = await call.then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error, "saveAdminOffer resolved: the sentinel rate write did not fail").not.toBeNull();
+    const cause = rootCauseMessage(error);
+    expect(cause).toMatch(/check constraint/i);
+    expect(cause).toContain(SENTINEL_CONSTRAINT_NAME);
+  }
+
   beforeAll(async () => {
     database = await setupIntegrationDatabase();
     applicationDb = await importApplicationDb(database);
@@ -184,9 +206,7 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
   it("Test A — create path: a failing rate INSERT leaves no offer behind", async () => {
     expect(await offerRows()).toHaveLength(0);
 
-    await expect(saveAdminOffer({ ...baseInput, price: SENTINEL_REJECTED_PRICE })).rejects.toThrow(
-      /check constraint|travelcorner_test_rate_write_sentinel/i,
-    );
+    await expectSentinelRejection(saveAdminOffer({ ...baseInput, price: SENTINEL_REJECTED_PRICE }));
 
     // Without the transaction the offer INSERT would have committed before the rate INSERT failed.
     expect(await offerRows()).toHaveLength(0);
@@ -201,9 +221,9 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
     const rateBefore = snapshot((await rateRows(offerId))[0]);
     expect(offerBefore.lastPriceUpdatedAt).toBeTruthy();
 
-    await expect(
+    await expectSentinelRejection(
       saveAdminOffer({ ...baseInput, id: offerId, price: SENTINEL_REJECTED_PRICE, priceLabelEn: "Rolled back" }),
-    ).rejects.toThrow(/check constraint|travelcorner_test_rate_write_sentinel/i);
+    );
 
     const offerAfter = snapshot((await offerRows())[0]);
     const ratesAfter = await rateRows(offerId);
@@ -221,9 +241,7 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
 
     const offerBefore = snapshot((await offerRows())[0]);
 
-    await expect(saveAdminOffer({ ...baseInput, id: offerId, price: SENTINEL_REJECTED_PRICE })).rejects.toThrow(
-      /check constraint|travelcorner_test_rate_write_sentinel/i,
-    );
+    await expectSentinelRejection(saveAdminOffer({ ...baseInput, id: offerId, price: SENTINEL_REJECTED_PRICE }));
 
     expect(snapshot((await offerRows())[0])).toEqual(offerBefore);
     expect(await rateRows(offerId)).toHaveLength(0);

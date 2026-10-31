@@ -37,7 +37,8 @@ import path from "node:path";
  */
 export const SENTINEL_REJECTED_PRICE = "6666.00";
 
-const SENTINEL_CONSTRAINT = "travelcorner_test_rate_write_sentinel";
+/** Name of the CHECK constraint that rejects SENTINEL_REJECTED_PRICE, asserted on by the tests. */
+export const SENTINEL_CONSTRAINT_NAME = "travelcorner_test_rate_write_sentinel";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -206,7 +207,7 @@ export async function setupIntegrationDatabase(): Promise<IntegrationDatabase> {
     // while the offer write that precedes it does not — which is exactly what makes a
     // non-atomic implementation observable.
     await admin.query(
-      `ALTER TABLE \`offerRatePeriods\` ADD CONSTRAINT \`${SENTINEL_CONSTRAINT}\` CHECK (\`price\` <> ${SENTINEL_REJECTED_PRICE})`,
+      `ALTER TABLE \`offerRatePeriods\` ADD CONSTRAINT \`${SENTINEL_CONSTRAINT_NAME}\` CHECK (\`price\` <> ${SENTINEL_REJECTED_PRICE})`,
     );
   } catch (error) {
     if (created) {
@@ -274,8 +275,49 @@ export async function importApplicationDb(database: IntegrationDatabase) {
   return import("./db");
 }
 
-/** Close the pool server/db.ts opened, so the Vitest worker does not hang on an open handle. */
+/**
+ * Close the pool server/db.ts opened, so the Vitest worker does not hang on an open handle.
+ *
+ * drizzle(string) builds its pool with createPool from "mysql2" — the callback API, not
+ * mysql2/promise — so `end()` takes a callback and returns void. Treating it as a promise threw
+ * `Cannot read properties of undefined (reading 'catch')` and failed teardown.
+ */
 export async function closeApplicationPool(module: { getDb: () => Promise<unknown> }): Promise<void> {
-  const db = (await module.getDb()) as { $client?: { end?: () => Promise<void> } } | null;
-  await db?.$client?.end?.().catch(() => undefined);
+  const db = (await module.getDb()) as
+    | { $client?: { end?: (callback?: (error?: unknown) => void) => void } }
+    | null;
+  const end = db?.$client?.end;
+  if (!end || !db?.$client) return;
+
+  await new Promise<void>((resolve) => {
+    try {
+      // Resolve on either outcome: a failed close must not mask a test result.
+      end.call(db.$client, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/**
+ * The message of the deepest cause of an error.
+ *
+ * Drizzle wraps every query failure in a DrizzleQueryError whose own message is only
+ * "Failed query: <sql> params: <params>", keeping the driver's error on `.cause`. Asserting against
+ * the wrapper therefore says nothing about *why* a write failed, so integration assertions walk to
+ * the root cause and match on that instead.
+ */
+export function rootCauseMessage(error: unknown): string {
+  const seen = new Set<unknown>();
+  let current = error;
+  let message = "";
+
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const candidate = (current as { message?: unknown }).message;
+    if (typeof candidate === "string" && candidate.length > 0) message = candidate;
+    current = (current as { cause?: unknown }).cause;
+  }
+
+  return message || String(error);
 }
