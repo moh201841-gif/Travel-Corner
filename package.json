@@ -11,6 +11,8 @@
     "format": "prettier --write .",
     "test": "vitest run",
     "test:integration": "TRAVEL_CORNER_REQUIRE_DB=1 vitest run server/lifecycle.integration.test.ts -t \"Finding 2 atomicity\"",
+    "db:migrate": "drizzle-kit migrate",
+    "admin:hash": "tsx scripts/hash-admin-password.ts",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"
   },
   "dependencies": {

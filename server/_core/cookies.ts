@@ -1,4 +1,5 @@
 import type { CookieOptions, Request } from "express";
+import { ENV } from "./env";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
@@ -39,10 +40,15 @@ export function getSessionCookieOptions(
   //       ? hostname
   //       : undefined;
 
+  const sameSite = ENV.sessionCookieSameSite;
+  const secure = isSecureRequest(req);
+
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req),
+    // SameSite=None is only honoured by browsers together with Secure, so fall back to
+    // "lax" on a plain-HTTP origin rather than emitting a cookie the browser discards.
+    sameSite: sameSite === "none" && !secure ? "lax" : sameSite,
+    secure,
   };
 }
