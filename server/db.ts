@@ -1,5 +1,7 @@
 import { and, asc, eq, gte, inArray, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG, MULTI_RATE_UMRAH_PRICE_ERR_MSG } from "@shared/const";
+import { hasCurrentRatePeriod, isOfferPubliclyVisible, isRatePeriodCurrent, isUmrahProgramPubliclyVisible, shouldAutoExpireOffer, shouldAutoExpireUmrahProgram } from "@shared/lifecycle";
 import { campaigns, enquiries, InsertUser, offerRatePeriods, siteSettings, travelOffers, umrahPrograms, umrahRateRows, users } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
@@ -94,18 +96,26 @@ async function applyPublicLifecycleRules(now = new Date()) {
   const db = await getDb();
   if (!db) return;
 
-  await db.update(umrahPrograms).set({ availability: "expired", isActive: false }).where(and(
+  // The SQL below narrows the candidate set; the shared predicate makes the final call, so the
+  // archive rule cannot drift from the visibility rule. Narrowing is safe in both directions:
+  // public reads independently apply isOfferPubliclyVisible / isUmrahProgramPubliclyVisible, so a
+  // record this rule declines to archive is still never shown to a customer.
+  const umrahCandidates = await db.select({ id: umrahPrograms.id, isActive: umrahPrograms.isActive, availability: umrahPrograms.availability, departureAt: umrahPrograms.departureAt }).from(umrahPrograms).where(and(
     lt(umrahPrograms.departureAt, now),
     ne(umrahPrograms.availability, "expired"),
     ne(umrahPrograms.availability, "hidden"),
   ));
+  const umrahToArchive = umrahCandidates.filter((program) => shouldAutoExpireUmrahProgram(program, now)).map((program) => program.id);
+  if (umrahToArchive.length) await db.update(umrahPrograms).set({ availability: "expired", isActive: false }).where(inArray(umrahPrograms.id, umrahToArchive));
 
-  await db.update(travelOffers).set({ availability: "expired", isActive: false }).where(and(
+  const offerCandidates = await db.select({ id: travelOffers.id, isActive: travelOffers.isActive, availability: travelOffers.availability, validUntil: travelOffers.validUntil }).from(travelOffers).where(and(
     lt(travelOffers.validUntil, now),
     ne(travelOffers.availability, "expired"),
     ne(travelOffers.availability, "hidden"),
     ne(travelOffers.availability, "sold_out"),
   ));
+  const offersToArchive = offerCandidates.filter((offer) => shouldAutoExpireOffer(offer, now)).map((offer) => offer.id);
+  if (offersToArchive.length) await db.update(travelOffers).set({ availability: "expired", isActive: false }).where(inArray(travelOffers.id, offersToArchive));
 }
 
 function currentOfferVisibility(now: Date) {
@@ -132,6 +142,8 @@ export async function listPublicOffers(filters: { destination?: string; tag?: st
   await applyPublicLifecycleRules(now);
   const rows = await db.select().from(travelOffers).where(currentOfferVisibility(now)).orderBy(asc(travelOffers.destinationEn), asc(travelOffers.hotelNameEn));
   const selected = rows.filter((offer) => {
+    // Defence in depth: the SQL WHERE above is a pre-filter, the shared predicate is authoritative.
+    if (!isOfferPubliclyVisible(offer, now)) return false;
     const tags = Array.isArray(offer.hotelTags) ? offer.hotelTags.map(String) : [];
     if (filters.destination && offer.destinationEn.toLowerCase() !== filters.destination.toLowerCase() && offer.destinationAr !== filters.destination) return false;
     if (filters.tag && !tags.includes(filters.tag)) return false;
@@ -141,10 +153,19 @@ export async function listPublicOffers(filters: { destination?: string; tag?: st
   });
   if (selected.length === 0) return [];
   const rates = await db.select().from(offerRatePeriods).where(and(inArray(offerRatePeriods.offerId, selected.map((item) => item.id)), currentRateVisibility(now))).orderBy(asc(offerRatePeriods.price));
-  return selected.map((offer) => ({ ...offer, rates: rates.filter((rate) => rate.offerId === offer.id) })).filter((offer) => offer.rates.length > 0);
+  const currentRates = rates.filter((rate) => isRatePeriodCurrent(rate, now));
+  return selected.map((offer) => ({ ...offer, rates: currentRates.filter((rate) => rate.offerId === offer.id) })).filter((offer) => hasCurrentRatePeriod(offer.rates, now));
 }
 
-/** Retrieve a detailed hotel offer and all time-windowed price rows by its stable public slug. */
+/**
+ * Retrieve a detailed hotel offer and its currently valid price rows by its stable public slug.
+ *
+ * An offer carrying no current rate period is not bookable, so it is withheld here exactly as
+ * listPublicOffers withholds it from the listing. Both paths therefore answer the same question with
+ * the same rule. Without this, an offer whose rate windows had all closed stayed reachable by direct
+ * link with an empty rates array: a priced product presented with no price, still accepting
+ * enquiries.
+ */
 export async function getPublicOfferBySlug(slug: string) {
   const db = await getDb();
   if (!db) return undefined;
@@ -152,9 +173,11 @@ export async function getPublicOfferBySlug(slug: string) {
   await applyPublicLifecycleRules(now);
   const rows = await db.select().from(travelOffers).where(and(eq(travelOffers.slug, slug), currentOfferVisibility(now))).limit(1);
   const offer = rows[0];
-  if (!offer) return undefined;
+  if (!offer || !isOfferPubliclyVisible(offer, now)) return undefined;
   const rates = await db.select().from(offerRatePeriods).where(and(eq(offerRatePeriods.offerId, offer.id), currentRateVisibility(now))).orderBy(asc(offerRatePeriods.validFrom), asc(offerRatePeriods.price));
-  return { ...offer, rates };
+  const currentRates = rates.filter((rate) => isRatePeriodCurrent(rate, now));
+  if (!hasCurrentRatePeriod(currentRates, now)) return undefined;
+  return { ...offer, rates: currentRates };
 }
 
 /** The public Umrah listing is separate from leisure travel to retain its distinct product structure. */
@@ -163,7 +186,8 @@ export async function listPublicUmrahPrograms() {
   if (!db) return [];
   const now = new Date();
   await applyPublicLifecycleRules(now);
-  const programs = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).orderBy(asc(umrahPrograms.departureAt));
+  const rows = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).orderBy(asc(umrahPrograms.departureAt));
+  const programs = rows.filter((program) => isUmrahProgramPubliclyVisible(program, now));
   if (programs.length === 0) return [];
   const rates = await db.select().from(umrahRateRows).where(inArray(umrahRateRows.programId, programs.map((item) => item.id))).orderBy(asc(umrahRateRows.price));
   return programs.map((program) => ({ ...program, rates: rates.filter((rate) => rate.programId === program.id) }));
@@ -176,7 +200,7 @@ export async function getPublicUmrahProgramBySlug(slug: string) {
   await applyPublicLifecycleRules(now);
   const programs = await db.select().from(umrahPrograms).where(and(eq(umrahPrograms.slug, slug), eq(umrahPrograms.isActive, true), ne(umrahPrograms.availability, "hidden"), ne(umrahPrograms.availability, "expired"), or(isNull(umrahPrograms.departureAt), gte(umrahPrograms.departureAt, now)))).limit(1);
   const program = programs[0];
-  if (!program) return undefined;
+  if (!program || !isUmrahProgramPubliclyVisible(program, now)) return undefined;
   const rates = await db.select().from(umrahRateRows).where(eq(umrahRateRows.programId, program.id)).orderBy(asc(umrahRateRows.price));
   return { ...program, rates };
 }
@@ -216,21 +240,59 @@ export async function listAdminOffers() {
 
 export type AdminOfferInput = { id?: number; slug: string; destinationEn: string; destinationAr: string; hotelNameEn: string; hotelNameAr: string; areaEn?: string; areaAr?: string; days: number; nights: number; mealPlanEn: string; mealPlanAr: string; transportationIncluded: boolean; availability: "available" | "limited" | "on_request" | "sold_out" | "expired" | "hidden"; isActive: boolean; validUntil?: Date; price?: string; priceLabelEn?: string; priceLabelAr?: string };
 
-/** Create or update a hotel package and retain one editable headline rate for no-code staff operations. */
+/**
+ * Create or update a hotel package and maintain a single headline rate for no-code staff operations.
+ *
+ * Headline-price rules (D9):
+ *   0 rate rows → create exactly one
+ *   1 rate row  → update that row
+ *   2+ rate rows → refuse, because any choice would be a guess
+ *
+ * The previous implementation selected a row with an unordered `LIMIT 1`, which MySQL does not
+ * guarantee to be stable, so editing an offer could silently rewrite an arbitrary seasonal rate.
+ *
+ * Offer validity and rate validity are separate concepts: this function never writes
+ * validFrom/validUntil on a rate row. Rate windows are owned exclusively by the rate editor.
+ *
+ * The offer write and the headline-rate write are one transaction, so a failure part-way through can
+ * no longer leave the offer updated while its price is not — a state that also stamped
+ * lastPriceUpdatedAt as though the price had been written, and so concealed itself. The D9 read sits
+ * inside the transaction so the rows it counts are the rows the write acts on.
+ *
+ * Scope limit, deliberately stated: the transaction makes this operation all-or-nothing. It does NOT
+ * prevent a concurrent replaceOfferRates from inserting rate rows between the D9 read and the rate
+ * write, so the D9 refusal remains bypassable under concurrent admin edits. Closing that race needs
+ * a locking or isolation strategy whose behaviour on TiDB is unverified; it is registered as deferred
+ * coverage in server/lifecycle.integration.test.ts rather than guessed at here.
+ */
 export async function saveAdminOffer(input: AdminOfferInput) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
-  const patch = { slug: input.slug, destinationEn: input.destinationEn, destinationAr: input.destinationAr, hotelNameEn: input.hotelNameEn, hotelNameAr: input.hotelNameAr, areaEn: input.areaEn || null, areaAr: input.areaAr || null, days: input.days, nights: input.nights, mealPlanEn: input.mealPlanEn, mealPlanAr: input.mealPlanAr, transportationIncluded: input.transportationIncluded, availability: input.availability, isActive: input.isActive, validUntil: input.validUntil ?? null, lastPriceUpdatedAt: new Date() };
-  const insertedOffer = input.id ? null : await db.insert(travelOffers).values(patch);
-  const id = input.id ?? Number((insertedOffer as unknown as Array<{ insertId: number }>)[0]?.insertId);
-  if (input.id) await db.update(travelOffers).set(patch).where(eq(travelOffers.id, input.id));
-  if (input.price) {
-    const existing = await db.select().from(offerRatePeriods).where(eq(offerRatePeriods.offerId, id)).limit(1);
-    const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, validUntil: input.validUntil ?? null, lastUpdatedAt: new Date() };
-    if (existing[0]) await db.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, existing[0].id));
-    else await db.insert(offerRatePeriods).values({ offerId: id, occupancy: "per_person", currency: "EGP", ...ratePatch });
-  }
-  return { id };
+
+  return db.transaction(async (tx) => {
+    // Counted inside the transaction so a refusal reflects the rows this write would act on, and so
+    // a refusal rolls back rather than relying on being reached before the first write.
+    let existingRateIds: number[] = [];
+    if (input.id && input.price) {
+      const existingRates = await tx.select({ id: offerRatePeriods.id }).from(offerRatePeriods).where(eq(offerRatePeriods.offerId, input.id));
+      if (existingRates.length > 1) throw new Error(MULTI_RATE_HEADLINE_PRICE_ERR_MSG);
+      existingRateIds = existingRates.map((rate) => rate.id);
+    }
+
+    const patch = { slug: input.slug, destinationEn: input.destinationEn, destinationAr: input.destinationAr, hotelNameEn: input.hotelNameEn, hotelNameAr: input.hotelNameAr, areaEn: input.areaEn || null, areaAr: input.areaAr || null, days: input.days, nights: input.nights, mealPlanEn: input.mealPlanEn, mealPlanAr: input.mealPlanAr, transportationIncluded: input.transportationIncluded, availability: input.availability, isActive: input.isActive, validUntil: input.validUntil ?? null, lastPriceUpdatedAt: new Date() };
+    const insertedOffer = input.id ? null : await tx.insert(travelOffers).values(patch);
+    const id = input.id ?? Number((insertedOffer as unknown as Array<{ insertId: number }>)[0]?.insertId);
+    if (input.id) await tx.update(travelOffers).set(patch).where(eq(travelOffers.id, input.id));
+
+    if (input.price) {
+      const ratePatch = { price: input.price, labelEn: input.priceLabelEn || null, labelAr: input.priceLabelAr || null, lastUpdatedAt: new Date() };
+      const targetRateId = existingRateIds[0];
+      if (targetRateId !== undefined) await tx.update(offerRatePeriods).set(ratePatch).where(eq(offerRatePeriods.id, targetRateId));
+      else await tx.insert(offerRatePeriods).values({ offerId: id, occupancy: "per_person", currency: "EGP", ...ratePatch });
+    }
+
+    return { id };
+  });
 }
 
 export async function updateOfferStatus(id: number, patch: Pick<typeof travelOffers.$inferInsert, "isActive" | "availability">) {
@@ -250,14 +312,32 @@ export async function updateOfferMedia(id: number, patch: Pick<typeof travelOffe
 
 export type AdminRateInput = { labelEn?: string; labelAr?: string; occupancy: string; price: string; childPrice?: string; infantPrice?: string; validFrom?: Date; validUntil?: Date; notesEn?: string; notesAr?: string };
 
-/** Replace staff-entered hotel rate periods atomically so an offer never exposes a partially edited public price table. */
+/**
+ * Replace staff-entered hotel rate periods atomically so an offer never exposes a partially edited
+ * public price table.
+ *
+ * The DELETE, the INSERT and the headline-timestamp UPDATE are one transaction (D6). Before that
+ * they were three separate auto-committed statements, and the DELETE removed every rate row before
+ * the INSERT was attempted: a failure in between destroyed the offer's entire price table. Because a
+ * published offer carrying no current rate is withheld from both public read paths, the offer then
+ * vanished from the site rather than showing a stale price, so a transient failure during an
+ * ordinary price edit silently removed a product from the catalogue.
+ *
+ * Scope limit, as with saveAdminOffer: this makes the operation all-or-nothing. It does not
+ * serialise this function against a concurrent saveAdminOffer, whose headline-price rules read the
+ * same rows; closing that race needs locking semantics that are unverified on TiDB and is tracked as
+ * deferred coverage in server/lifecycle.integration.test.ts.
+ */
 export async function replaceOfferRates(offerId: number, rates: AdminRateInput[]) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
-  await db.delete(offerRatePeriods).where(eq(offerRatePeriods.offerId, offerId));
-  if (rates.length) await db.insert(offerRatePeriods).values(rates.map((rate) => ({ offerId, labelEn: rate.labelEn || null, labelAr: rate.labelAr || null, occupancy: rate.occupancy, price: rate.price, currency: "EGP", childPrice: rate.childPrice || null, infantPrice: rate.infantPrice || null, validFrom: rate.validFrom ?? null, validUntil: rate.validUntil ?? null, notesEn: rate.notesEn || null, notesAr: rate.notesAr || null, lastUpdatedAt: new Date() })));
-  await db.update(travelOffers).set({ lastPriceUpdatedAt: new Date() }).where(eq(travelOffers.id, offerId));
-  return { success: true };
+
+  return db.transaction(async (tx) => {
+    await tx.delete(offerRatePeriods).where(eq(offerRatePeriods.offerId, offerId));
+    if (rates.length) await tx.insert(offerRatePeriods).values(rates.map((rate) => ({ offerId, labelEn: rate.labelEn || null, labelAr: rate.labelAr || null, occupancy: rate.occupancy, price: rate.price, currency: "EGP", childPrice: rate.childPrice || null, infantPrice: rate.infantPrice || null, validFrom: rate.validFrom ?? null, validUntil: rate.validUntil ?? null, notesEn: rate.notesEn || null, notesAr: rate.notesAr || null, lastUpdatedAt: new Date() })));
+    await tx.update(travelOffers).set({ lastPriceUpdatedAt: new Date() }).where(eq(travelOffers.id, offerId));
+    return { success: true };
+  });
 }
 
 export async function listAdminUmrahPrograms() {
@@ -271,21 +351,53 @@ export async function listAdminUmrahPrograms() {
 
 export type AdminUmrahInput = { id?: number; slug: string; titleEn: string; titleAr: string; departureAt?: Date; returnAt?: Date; durationDays?: number; airline?: string; makkahHotelEn?: string; makkahHotelAr?: string; madinahHotelEn?: string; madinahHotelAr?: string; availability: "available" | "limited" | "on_request" | "sold_out" | "expired" | "hidden"; isActive: boolean; price?: string; roomType?: string };
 
-/** Create or update a structured Umrah program plus its headline occupancy rate. */
+/**
+ * Create or update a structured Umrah program plus its headline occupancy rate.
+ *
+ * Headline-price rules (D9-U), mirroring the offer editor:
+ *   0 rate rows → create exactly one
+ *   1 rate row  → update that row
+ *   2+ rate rows → refuse, because any choice would be a guess
+ *
+ * The previous implementation selected a row with an unordered `LIMIT 1` and then overwrote both its
+ * price and its roomType. A program carrying Quad/Triple/Double fares therefore had an arbitrary
+ * occupancy silently rewritten: the Double row could come back as a second "Quad" at the starting
+ * price, and the Double fare was gone. No failure was required — editing the title or the airline was
+ * enough, because the editor submitted its prefilled price on every save.
+ *
+ * The program write and the rate write are one transaction, and the rate count is read inside it, so
+ * a refusal rolls back rather than relying on being reached before the first write.
+ *
+ * Scope limit, as elsewhere: this does not serialise against a concurrent replaceUmrahRates.
+ */
 export async function saveAdminUmrahProgram(input: AdminUmrahInput) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
-  const patch = { slug: input.slug, titleEn: input.titleEn, titleAr: input.titleAr, departureAt: input.departureAt ?? null, returnAt: input.returnAt ?? null, durationDays: input.durationDays ?? null, airline: input.airline || null, makkahHotelEn: input.makkahHotelEn || null, makkahHotelAr: input.makkahHotelAr || null, madinahHotelEn: input.madinahHotelEn || null, madinahHotelAr: input.madinahHotelAr || null, availability: input.availability, isActive: input.isActive, lastUpdatedAt: new Date() };
-  const insertedProgram = input.id ? null : await db.insert(umrahPrograms).values(patch);
-  const id = input.id ?? Number((insertedProgram as unknown as Array<{ insertId: number }>)[0]?.insertId);
-  if (input.id) await db.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, input.id));
-  if (input.price) {
-    const existing = await db.select().from(umrahRateRows).where(eq(umrahRateRows.programId, id)).limit(1);
-    const ratePatch = { roomType: input.roomType || "Quad", price: input.price, currency: "EGP" };
-    if (existing[0]) await db.update(umrahRateRows).set(ratePatch).where(eq(umrahRateRows.id, existing[0].id));
-    else await db.insert(umrahRateRows).values({ programId: id, ...ratePatch });
-  }
-  return { id };
+
+  return db.transaction(async (tx) => {
+    // Counted inside the transaction so a refusal reflects the rows this write would act on, and
+    // targeted by explicit id afterwards rather than by an unordered LIMIT 1.
+    let existingRateIds: number[] = [];
+    if (input.id && input.price) {
+      const existingRates = await tx.select({ id: umrahRateRows.id }).from(umrahRateRows).where(eq(umrahRateRows.programId, input.id));
+      if (existingRates.length > 1) throw new Error(MULTI_RATE_UMRAH_PRICE_ERR_MSG);
+      existingRateIds = existingRates.map((rate) => rate.id);
+    }
+
+    const patch = { slug: input.slug, titleEn: input.titleEn, titleAr: input.titleAr, departureAt: input.departureAt ?? null, returnAt: input.returnAt ?? null, durationDays: input.durationDays ?? null, airline: input.airline || null, makkahHotelEn: input.makkahHotelEn || null, makkahHotelAr: input.makkahHotelAr || null, madinahHotelEn: input.madinahHotelEn || null, madinahHotelAr: input.madinahHotelAr || null, availability: input.availability, isActive: input.isActive, lastUpdatedAt: new Date() };
+    const insertedProgram = input.id ? null : await tx.insert(umrahPrograms).values(patch);
+    const id = input.id ?? Number((insertedProgram as unknown as Array<{ insertId: number }>)[0]?.insertId);
+    if (input.id) await tx.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, input.id));
+
+    if (input.price) {
+      const ratePatch = { roomType: input.roomType || "Quad", price: input.price, currency: "EGP" };
+      const targetRateId = existingRateIds[0];
+      if (targetRateId !== undefined) await tx.update(umrahRateRows).set(ratePatch).where(eq(umrahRateRows.id, targetRateId));
+      else await tx.insert(umrahRateRows).values({ programId: id, ...ratePatch });
+    }
+
+    return { id };
+  });
 }
 
 export async function updateUmrahStatus(id: number, patch: Pick<typeof umrahPrograms.$inferInsert, "isActive" | "availability">) {
@@ -297,12 +409,27 @@ export async function updateUmrahStatus(id: number, patch: Pick<typeof umrahProg
 
 export type AdminUmrahRateInput = { roomType: string; price: string; notesEn?: string; notesAr?: string };
 
-/** Replace staff-managed Umrah occupancy rates atomically so every program keeps a complete, ordered price list. */
+/**
+ * Replace staff-managed Umrah occupancy rates atomically so every program keeps a complete, ordered
+ * price list.
+ *
+ * The DELETE, the INSERT and the program timestamp UPDATE are one transaction (D7). Before that they
+ * were three separate auto-committed statements, and the DELETE removed every occupancy row before
+ * the INSERT was attempted: a failure in between destroyed the program's whole room-type price list.
+ * The public Umrah listing does not withhold a program that has no rates, so the program stayed
+ * visible to customers showing no prices at all.
+ *
+ * Same scope limit as replaceOfferRates: this makes the operation all-or-nothing, and does not
+ * serialise it against a concurrent saveAdminUmrahProgram.
+ */
 export async function replaceUmrahRates(programId: number, rates: AdminUmrahRateInput[]) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
-  await db.delete(umrahRateRows).where(eq(umrahRateRows.programId, programId));
-  if (rates.length) await db.insert(umrahRateRows).values(rates.map((rate) => ({ programId, roomType: rate.roomType, price: rate.price, currency: "EGP", notesEn: rate.notesEn || null, notesAr: rate.notesAr || null })));
-  await db.update(umrahPrograms).set({ lastUpdatedAt: new Date() }).where(eq(umrahPrograms.id, programId));
-  return { success: true };
+
+  return db.transaction(async (tx) => {
+    await tx.delete(umrahRateRows).where(eq(umrahRateRows.programId, programId));
+    if (rates.length) await tx.insert(umrahRateRows).values(rates.map((rate) => ({ programId, roomType: rate.roomType, price: rate.price, currency: "EGP", notesEn: rate.notesEn || null, notesAr: rate.notesAr || null })));
+    await tx.update(umrahPrograms).set({ lastUpdatedAt: new Date() }).where(eq(umrahPrograms.id, programId));
+    return { success: true };
+  });
 }

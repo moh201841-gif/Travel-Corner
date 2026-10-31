@@ -11,22 +11,32 @@ function createPublicContext(): TrpcContext {
   };
 }
 
-describe("Travel Corner public travel procedures", () => {
-  it("returns a safe array shape when browsing hotel offers", async () => {
-    const caller = appRouter.createCaller(createPublicContext());
-    const offers = await caller.travel.offers();
+const hasDatabase = Boolean(process.env.DATABASE_URL);
 
-    expect(Array.isArray(offers)).toBe(true);
-    expect(offers.every((offer) => !offer.validUntil || new Date(offer.validUntil).getTime() >= Date.now())).toBe(true);
+/**
+ * Degraded-mode contract only.
+ *
+ * These previously asserted lifecycle correctness with `.every()` over collections that were always
+ * empty, so they passed whether or not the lifecycle rules worked. They now assert a concrete value
+ * and make no lifecycle claim; lifecycle behaviour is covered deterministically in
+ * server/lifecycle.test.ts, and its database-dependent half is declared in
+ * server/lifecycle.integration.test.ts.
+ */
+describe.skipIf(hasDatabase)("Travel Corner public procedures without a configured database", () => {
+  it("returns an empty offer list instead of throwing", async () => {
+    const caller = appRouter.createCaller(createPublicContext());
+
+    await expect(caller.travel.offers()).resolves.toEqual([]);
   });
 
-  it("does not return Umrah programs whose departure has passed", async () => {
+  it("returns an empty Umrah list instead of throwing", async () => {
     const caller = appRouter.createCaller(createPublicContext());
-    const programs = await caller.travel.umrahPrograms();
 
-    expect(programs.every((program) => !program.departureAt || new Date(program.departureAt).getTime() >= Date.now())).toBe(true);
+    await expect(caller.travel.umrahPrograms()).resolves.toEqual([]);
   });
+});
 
+describe("Travel Corner enquiry validation", () => {
   it("rejects an enquiry with no usable contact method before attempting persistence", async () => {
     const caller = appRouter.createCaller(createPublicContext());
 

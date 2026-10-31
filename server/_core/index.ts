@@ -51,15 +51,25 @@ async function startServer() {
     serveStatic(app);
   }
 
+  const isProduction = process.env.NODE_ENV === "production";
   const preferredPort = parseInt(process.env.PORT || "3000");
-  const port = await findAvailablePort(preferredPort);
+
+  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) {
+    throw new Error(`PORT is not a valid port number: ${JSON.stringify(process.env.PORT)}`);
+  }
+
+  // A hosting platform assigns PORT and health-checks exactly that port. Scanning for an alternative
+  // would bind one the platform never probes, which surfaces as an opaque "port scan timeout" rather
+  // than a clear error — so in production bind PORT or fail loudly. The scan stays in development,
+  // where several instances may run side by side.
+  const port = isProduction ? preferredPort : await findAvailablePort(preferredPort);
 
   if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
 
   server.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}/`);
+    console.log(`Server running on port ${port}`);
   });
 }
 

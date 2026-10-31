@@ -7,6 +7,16 @@ import { createEnquiry, getPublicCampaigns, getPublicOfferBySlug, getPublicSetti
 import { storagePut } from "../storage";
 
 const availabilityValues = ["available", "limited", "on_request", "sold_out", "expired", "hidden"] as const;
+
+/**
+ * Treat a blank string as an absent value for optional enquiry fields.
+ *
+ * A browser form submits "" for an untouched input, which is not the same as omitting the key:
+ * `z.string().email()` and `z.string().min(…)` both reject "". Without this, a visitor who supplied
+ * only a phone number had their enquiry rejected. Genuinely invalid values are still rejected.
+ */
+const blankAsMissing = <TSchema extends z.ZodType<string, string>>(schema: TSchema) =>
+  z.union([z.literal(""), schema]).optional().transform((value) => (value === "" ? undefined : value));
 const imageAssetSchema = z.object({ url: z.string().min(1).max(1000), altEn: z.string().max(240).optional(), altAr: z.string().max(240).optional() });
 const adminOfferSchema = z.object({ id: z.number().int().positive().optional(), slug: z.string().trim().min(3).max(160), destinationEn: z.string().trim().min(2).max(120), destinationAr: z.string().trim().min(2).max(120), hotelNameEn: z.string().trim().min(2).max(180), hotelNameAr: z.string().trim().min(2).max(180), areaEn: z.string().trim().max(180).optional(), areaAr: z.string().trim().max(180).optional(), days: z.number().int().min(1).max(30), nights: z.number().int().min(0).max(29), mealPlanEn: z.string().trim().min(2).max(120), mealPlanAr: z.string().trim().min(2).max(120), transportationIncluded: z.boolean(), availability: z.enum(availabilityValues), isActive: z.boolean(), validUntil: z.date().optional(), price: z.string().regex(/^\d+(\.\d{1,2})?$/).optional(), priceLabelEn: z.string().trim().max(140).optional(), priceLabelAr: z.string().trim().max(140).optional() });
 const adminUmrahSchema = z.object({ id: z.number().int().positive().optional(), slug: z.string().trim().min(3).max(160), titleEn: z.string().trim().min(2).max(180), titleAr: z.string().trim().min(2).max(180), departureAt: z.date().optional(), returnAt: z.date().optional(), durationDays: z.number().int().min(1).max(30).optional(), airline: z.string().trim().max(160).optional(), makkahHotelEn: z.string().trim().max(180).optional(), makkahHotelAr: z.string().trim().max(180).optional(), madinahHotelEn: z.string().trim().max(180).optional(), madinahHotelAr: z.string().trim().max(180).optional(), availability: z.enum(availabilityValues), isActive: z.boolean(), price: z.string().regex(/^\d+(\.\d{1,2})?$/).optional(), roomType: z.string().trim().max(60).optional() });
@@ -24,20 +34,20 @@ export const travelRouter = router({
     kind: z.enum(["hotel_offer", "umrah", "custom_trip", "callback"]),
     offerId: z.number().int().positive().optional(),
     umrahProgramId: z.number().int().positive().optional(),
-    sourcePath: z.string().max(255).optional(),
+    sourcePath: blankAsMissing(z.string().max(255)),
     preferredContact: z.enum(["whatsapp", "phone", "email"]).default("whatsapp"),
-    name: z.string().trim().min(2).max(160).optional(),
-    phone: z.string().trim().min(6).max(40).optional(),
-    whatsapp: z.string().trim().min(6).max(40).optional(),
-    email: z.string().email().max(320).optional(),
+    name: blankAsMissing(z.string().trim().min(2).max(160)),
+    phone: blankAsMissing(z.string().trim().min(6).max(40)),
+    whatsapp: blankAsMissing(z.string().trim().min(6).max(40)),
+    email: blankAsMissing(z.string().email().max(320)),
     travelDate: z.date().optional(),
-    destination: z.string().trim().max(180).optional(),
-    travellers: z.string().trim().max(120).optional(),
-    preferences: z.string().trim().max(2000).optional(),
-    budget: z.string().trim().max(120).optional(),
+    destination: blankAsMissing(z.string().trim().max(180)),
+    travellers: blankAsMissing(z.string().trim().max(120)),
+    preferences: blankAsMissing(z.string().trim().max(2000)),
+    budget: blankAsMissing(z.string().trim().max(120)),
     language: z.enum(["ar", "en"]).optional(),
-    travellerNotes: z.string().trim().max(3000).optional(),
-  }).refine((data) => Boolean(data.phone || data.email), { message: "Provide a phone number or email address." })).mutation(({ input }) => createEnquiry(input)),
+    travellerNotes: blankAsMissing(z.string().trim().max(3000)),
+  }).refine((data) => Boolean(data.phone || data.email || data.whatsapp), { message: "Provide a phone number, WhatsApp number, or email address." })).mutation(({ input }) => createEnquiry(input)),
   admin: router({
     offers: adminProcedure.query(() => listAdminOffers()),
     saveOffer: adminProcedure.input(adminOfferSchema).mutation(({ input }) => saveAdminOffer(input)),

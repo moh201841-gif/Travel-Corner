@@ -4,6 +4,17 @@ export const AXIOS_TIMEOUT_MS = 30_000;
 export const UNAUTHED_ERR_MSG = 'Please login (10001)';
 export const NOT_ADMIN_ERR_MSG = 'You do not have required permission (10002)';
 
+// Raised when the offer editor's single headline price cannot be applied because the package has
+// several price periods. Shared so the admin UI can recognise this one known business refusal and
+// show it verbatim, while every other server failure falls back to a generic message rather than
+// leaking raw database error text to the operator.
+export const MULTI_RATE_HEADLINE_PRICE_ERR_MSG = 'This package has more than one price period, so the headline price cannot be applied here. Use "Price periods & occupancy" to edit the intended period (10003)';
+
+// The Umrah equivalent. A program normally carries several occupancies (Quad/Triple/Double), so the
+// single "Starting price" field cannot say which one it means; the editor must send no price and the
+// server refuses if one arrives anyway.
+export const MULTI_RATE_UMRAH_PRICE_ERR_MSG = 'This program has more than one occupancy rate, so the starting price cannot be applied here. Use "Occupancy rates" to edit the intended room type (10004)';
+
 // One-time nonce cookie that binds an OAuth login to the browser that started
 // it. The `__Host-` prefix forces the cookie host-only (Secure, Path=/, no
 // Domain), so a sibling *.manus.space site cannot plant a matching value in a
