@@ -1,24 +1,42 @@
 /**
- * Travel Corner lifecycle — database-dependent coverage. CURRENTLY BLOCKED.
+ * Travel Corner lifecycle — database-dependent coverage.
  *
- * This file deliberately contains no working integration tests. During Phase 0.5 no database was
- * reachable (no DATABASE_URL, no TEST_DATABASE_URL, MySQL port unreachable), so the behaviours below
- * could not be written against a real server or executed even once.
+ * This file holds two distinct groups.
  *
- * The file exists so the gap is visible in the test report rather than invisible. It is arranged so
- * that it can never produce a false green:
+ * EXECUTABLE (3 tests, "Finding 2 atomicity [executable]")
+ *   Real integration tests that run saveAdminOffer against a disposable MySQL 8 database and assert
+ *   that a failing headline-rate write leaves no partial offer state behind. Nothing is mocked: the
+ *   transaction, the SQL and the failure are all server-side. They run when TEST_DATABASE_URL is set
+ *   (or when TRAVEL_CORNER_REQUIRE_DB=1 forces a hard failure instead of a skip) and are selected on
+ *   their own by `pnpm test:integration`.
  *
- *   - Without TEST_DATABASE_URL the suite is skipped and a banner names exactly what is unverified.
- *   - With TEST_DATABASE_URL the suite runs and FAILS, because the bodies are not implemented.
- *     A red suite is the correct signal: supplying a database does not retroactively create
- *     coverage that was never written.
+ * BLOCKED (13 entries)
+ *   Behaviours that still have no implementation. During Phase 0.5 no database was reachable, so they
+ *   could not be written or executed even once. They remain arranged so they can never produce a
+ *   false green:
+ *     - Without TEST_DATABASE_URL the suite is skipped and a banner names exactly what is unverified.
+ *     - With TEST_DATABASE_URL the suite runs and FAILS, because the bodies are not implemented.
+ *       A red suite is the correct signal: supplying a database does not retroactively create
+ *       coverage that was never written. `pnpm test:integration` therefore does not select them.
  *
- * Do not "fix" these by deleting them or by asserting something trivial. Implement them against a
- * disposable schema once database access is available.
+ * Do not "fix" the blocked entries by deleting them or by asserting something trivial. Implement them
+ * against a disposable schema, one at a time, the way the three executable tests below were.
  */
-import { describe, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  closeApplicationPool,
+  importApplicationDb,
+  setupIntegrationDatabase,
+  SENTINEL_REJECTED_PRICE,
+  type IntegrationDatabase,
+} from "./testDatabase";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+
+/** Set by `pnpm test:integration` so a missing database is a failure, never a silent skip. */
+const REQUIRE_DATABASE = process.env.TRAVEL_CORNER_REQUIRE_DB === "1";
+
+const RUN_EXECUTABLE = Boolean(TEST_DATABASE_URL) || REQUIRE_DATABASE;
 
 const BLOCKED_COVERAGE = [
   "SQL visibility clauses in db.ts conform to the shared lifecycle predicates over seeded fixtures",
@@ -27,13 +45,6 @@ const BLOCKED_COVERAGE = [
   "getPublicOfferBySlug withholds an offer whose rate windows have all closed (Finding 1)",
   "saveAdminOffer headline-price rules: 0 rows creates, 1 row updates, 2+ rows is refused (D9)",
   "saveAdminOffer never writes validFrom/validUntil on a rate row (K-2 separation)",
-  // Finding 2 — saveAdminOffer atomicity. The transaction boundary is implemented in server/db.ts
-  // and covered by mocked delegation tests in server/saveAdminOffer.transaction.test.ts. Those tests
-  // prove the code hands every operation to the transaction and lets failures propagate; they cannot
-  // prove the database discards the offer write. Only the entries below can, against a real server.
-  "saveAdminOffer create path: a failing rate INSERT leaves no travelOffers row behind (Finding 2)",
-  "saveAdminOffer edit path: a failing rate UPDATE leaves the offer row byte-identical, lastPriceUpdatedAt included (Finding 2)",
-  "saveAdminOffer edit path with zero rates: a failing rate INSERT leaves the offer unchanged and no rate row (Finding 2)",
   "saveAdminOffer D9 refusal on a multi-rate offer leaves every offer and rate row unchanged (Finding 2)",
   "saveAdminOffer success commits the offer and its headline rate together, and the returned id resolves (Finding 2)",
   "saveAdminOffer leaves validFrom/validUntil on the touched rate row untouched on both the success and the rollback path (Finding 2)",
@@ -52,6 +63,9 @@ if (!TEST_DATABASE_URL) {
       " TEST_DATABASE_URL is not set. The following are NOT verified:",
       ...BLOCKED_COVERAGE.map((item) => `   - ${item}`),
       "",
+      " The three saveAdminOffer rollback tests in this file are also skipped,",
+      " and they are the only database-dependent coverage that exists.",
+      "",
       " A passing suite does NOT mean these behaviours are correct.",
       "================================================================",
       "",
@@ -68,4 +82,150 @@ describe.skipIf(!TEST_DATABASE_URL)("Lifecycle integration [requires TEST_DATABA
       );
     });
   }
+});
+
+/**
+ * Real rollback coverage for Finding 2.
+ *
+ * saveAdminOffer writes the offer and its headline rate. Before the transaction boundary those were
+ * separate auto-committed statements, so a failing rate write left the offer updated with its price
+ * unchanged — and `lastPriceUpdatedAt` already stamped, which concealed it.
+ *
+ * Each test forces the SECOND write to fail using a CHECK constraint the harness installs on the
+ * disposable database, then asserts that the FIRST write did not survive. If saveAdminOffer ever
+ * regresses to separate statements, the offer row persists or changes and every assertion below
+ * fails. Fixtures are written and read with the harness's own admin connection, independently of the
+ * code under test.
+ */
+describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
+  let database: IntegrationDatabase;
+  let saveAdminOffer: typeof import("./db")["saveAdminOffer"];
+  let applicationDb: typeof import("./db");
+
+  const baseInput = {
+    slug: "integration-sharm-reef",
+    destinationEn: "Sharm El Sheikh",
+    destinationAr: "شرم الشيخ",
+    hotelNameEn: "Reef Oasis",
+    hotelNameAr: "ريف أوَيسيس",
+    days: 5,
+    nights: 4,
+    mealPlanEn: "All inclusive",
+    mealPlanAr: "إقامة كاملة",
+    transportationIncluded: true,
+    availability: "available" as const,
+    isActive: true,
+  };
+
+  const FIXTURE_PRICE_UPDATED_AT = "2026-03-01 10:00:00";
+  const FIXTURE_RATE_UPDATED_AT = "2026-03-01 10:00:00";
+
+  /** Date values come back as Date objects; normalise so a deep comparison is meaningful. */
+  const snapshot = (row: Record<string, unknown>) =>
+    Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [key, value instanceof Date ? value.toISOString() : value]),
+    );
+
+  const offerRows = () =>
+    database.query<Record<string, unknown>>("SELECT * FROM `travelOffers` WHERE `slug` = ?", [baseInput.slug]);
+  const rateRows = (offerId?: number) =>
+    offerId === undefined
+      ? database.query<Record<string, unknown>>("SELECT * FROM `offerRatePeriods`")
+      : database.query<Record<string, unknown>>("SELECT * FROM `offerRatePeriods` WHERE `offerId` = ?", [offerId]);
+
+  /** Seed an offer directly, so the fixture does not depend on the function under test. */
+  async function seedOffer(): Promise<number> {
+    await database.query(
+      "INSERT INTO `travelOffers` (`slug`, `destinationEn`, `destinationAr`, `hotelNameEn`, `hotelNameAr`, `days`, `nights`, `mealPlanEn`, `mealPlanAr`, `transportationIncluded`, `availability`, `isActive`, `lastPriceUpdatedAt`) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        baseInput.slug,
+        "Hurghada",
+        "الغردقة",
+        "Seeded Hotel",
+        "فندق مزروع",
+        6,
+        5,
+        "Half board",
+        "نصف إقامة",
+        0,
+        "limited",
+        1,
+        FIXTURE_PRICE_UPDATED_AT,
+      ],
+    );
+    const rows = await offerRows();
+    return Number(rows[0].id);
+  }
+
+  async function seedRate(offerId: number): Promise<void> {
+    await database.query(
+      "INSERT INTO `offerRatePeriods` (`offerId`, `occupancy`, `price`, `currency`, `labelEn`, `labelAr`, `validFrom`, `validUntil`, `lastUpdatedAt`) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [offerId, "per_person", "5500.00", "EGP", "Seeded label", "تسمية مزروعة", "2026-01-01 00:00:00", "2026-12-31 00:00:00", FIXTURE_RATE_UPDATED_AT],
+    );
+  }
+
+  beforeAll(async () => {
+    database = await setupIntegrationDatabase();
+    applicationDb = await importApplicationDb(database);
+    saveAdminOffer = applicationDb.saveAdminOffer;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (applicationDb) await closeApplicationPool(applicationDb);
+    if (database) await database.teardown();
+  }, 60_000);
+
+  beforeEach(async () => {
+    await database.reset();
+  });
+
+  it("Test A — create path: a failing rate INSERT leaves no offer behind", async () => {
+    expect(await offerRows()).toHaveLength(0);
+
+    await expect(saveAdminOffer({ ...baseInput, price: SENTINEL_REJECTED_PRICE })).rejects.toThrow(
+      /check constraint|travelcorner_test_rate_write_sentinel/i,
+    );
+
+    // Without the transaction the offer INSERT would have committed before the rate INSERT failed.
+    expect(await offerRows()).toHaveLength(0);
+    expect(await rateRows()).toHaveLength(0);
+  });
+
+  it("Test B — edit path: a failing rate UPDATE leaves offer and rate byte-identical", async () => {
+    const offerId = await seedOffer();
+    await seedRate(offerId);
+
+    const offerBefore = snapshot((await offerRows())[0]);
+    const rateBefore = snapshot((await rateRows(offerId))[0]);
+    expect(offerBefore.lastPriceUpdatedAt).toBeTruthy();
+
+    await expect(
+      saveAdminOffer({ ...baseInput, id: offerId, price: SENTINEL_REJECTED_PRICE, priceLabelEn: "Rolled back" }),
+    ).rejects.toThrow(/check constraint|travelcorner_test_rate_write_sentinel/i);
+
+    const offerAfter = snapshot((await offerRows())[0]);
+    const ratesAfter = await rateRows(offerId);
+
+    // A committed offer UPDATE would have changed hotelNameEn, availability, lastPriceUpdatedAt and
+    // updatedAt (ON UPDATE CURRENT_TIMESTAMP), so this equality is what detects a regression.
+    expect(offerAfter).toEqual(offerBefore);
+    expect(ratesAfter).toHaveLength(1);
+    expect(snapshot(ratesAfter[0])).toEqual(rateBefore);
+  });
+
+  it("Test C — edit path with zero rates: a failing rate INSERT leaves the offer unchanged", async () => {
+    const offerId = await seedOffer();
+    expect(await rateRows(offerId)).toHaveLength(0);
+
+    const offerBefore = snapshot((await offerRows())[0]);
+
+    await expect(saveAdminOffer({ ...baseInput, id: offerId, price: SENTINEL_REJECTED_PRICE })).rejects.toThrow(
+      /check constraint|travelcorner_test_rate_write_sentinel/i,
+    );
+
+    expect(snapshot((await offerRows())[0])).toEqual(offerBefore);
+    expect(await rateRows(offerId)).toHaveLength(0);
+  });
 });

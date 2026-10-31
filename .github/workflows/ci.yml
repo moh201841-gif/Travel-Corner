@@ -42,3 +42,76 @@ jobs:
         run: pnpm test
       - name: Build
         run: pnpm build
+
+  integration-mysql:
+    name: Database integration tests (disposable MySQL 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # No production or cloud database is reachable from this job. The only server is the
+      # localhost-bound service container below, which is destroyed with the job.
+      DATABASE_URL: ""
+      TEST_DATABASE_URL: "mysql://tc_it:integration-local-only@127.0.0.1:3306/"
+      # Throwaway credentials for an ephemeral localhost container. Not secrets, and deliberately
+      # inline rather than in GitHub Secrets so it is obvious nothing privileged is in play.
+      MYSQL_ROOT_PASSWORD: integration-root-local-only
+      INTEGRATION_DB_PASSWORD: integration-local-only
+      TZ: UTC
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: integration-root-local-only
+          TZ: UTC
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pintegration-root-local-only --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=30s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Ensure a MySQL client is available
+        run: command -v mysql || { sudo apt-get update && sudo apt-get install -y --no-install-recommends mysql-client; }
+      - name: Wait for MySQL to accept connections
+        run: |
+          for attempt in $(seq 1 60); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent; then
+              echo "MySQL is ready after ${attempt} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time." >&2
+          exit 1
+      - name: Confirm the server runs at UTC
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -uroot -p"$MYSQL_ROOT_PASSWORD" \
+            -e "SELECT TIMEDIFF(NOW(), UTC_TIMESTAMP()) AS utc_offset;"
+      - name: Create a least-privilege integration user
+        # Privileges are scoped to the disposable database names the harness generates
+        # (travelcorner_it_*), so this user cannot touch any other schema, and the backslash
+        # escapes keep the underscores literal rather than single-character wildcards.
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -uroot -p"$MYSQL_ROOT_PASSWORD" <<SQL
+          CREATE USER 'tc_it'@'%' IDENTIFIED BY '$INTEGRATION_DB_PASSWORD';
+          GRANT ALL PRIVILEGES ON \`travelcorner\_it\_%\`.* TO 'tc_it'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+      - name: Integration tests (three saveAdminOffer rollback cases)
+        # The harness creates its own uniquely named disposable database, applies the committed
+        # migrations to it, and drops it on teardown. It refuses to run against a non-loopback host
+        # or against the server configured as DATABASE_URL, and fails closed rather than skipping.
+        run: pnpm test:integration
