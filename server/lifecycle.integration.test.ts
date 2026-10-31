@@ -51,7 +51,6 @@ const BLOCKED_COVERAGE = [
   "saveAdminOffer success commits the offer and its headline rate together, and the returned id resolves (Finding 2)",
   "saveAdminOffer leaves validFrom/validUntil on the touched rate row untouched on both the success and the rollback path (Finding 2)",
   "saveAdminOffer versus a concurrent replaceOfferRates: the D9 refusal is not bypassed and no rate row is overwritten arbitrarily (Finding 2 — concurrency; a transaction alone does not close this race, and the required locking semantics are unverified on TiDB)",
-  "replaceOfferRates rolls back completely on a mid-operation failure (D6 — blocked)",
   "replaceUmrahRates rolls back completely on a mid-operation failure (D7 — blocked)",
   "rate reconciliation preserves childPrice, infantPrice and bilingual notes (D8 — blocked)",
 ];
@@ -99,9 +98,10 @@ describe.skipIf(!TEST_DATABASE_URL)("Lifecycle integration [requires TEST_DATABA
  * fails. Fixtures are written and read with the harness's own admin connection, independently of the
  * code under test.
  */
-describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
+describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [executable]", () => {
   let database: IntegrationDatabase;
   let saveAdminOffer: typeof import("./db")["saveAdminOffer"];
+  let replaceOfferRates: typeof import("./db")["replaceOfferRates"];
   let applicationDb: typeof import("./db");
 
   const baseInput = {
@@ -188,10 +188,25 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
     expect(cause).toContain(SENTINEL_CONSTRAINT_NAME);
   }
 
+  async function seedSecondRate(offerId: number): Promise<void> {
+    await database.query(
+      "INSERT INTO `offerRatePeriods` (`offerId`, `occupancy`, `price`, `currency`, `labelEn`, `labelAr`, `childPrice`, `infantPrice`, `validFrom`, `validUntil`, `notesEn`, `notesAr`, `lastUpdatedAt`) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [offerId, "per_person", "7100.00", "EGP", "Second seeded window", "النافذة الثانية", "3400.00", "600.00", "2026-02-01 00:00:00", "2026-11-30 00:00:00", "Seeded notes EN", "ملاحظات مزروعة", FIXTURE_RATE_UPDATED_AT],
+    );
+  }
+
+  /** Rows ordered by id, so a deep comparison across a rollback is stable. */
+  async function orderedRates(offerId: number) {
+    const rows = await rateRows(offerId);
+    return rows.sort((left, right) => Number(left.id) - Number(right.id)).map(snapshot);
+  }
+
   beforeAll(async () => {
     database = await setupIntegrationDatabase();
     applicationDb = await importApplicationDb(database);
     saveAdminOffer = applicationDb.saveAdminOffer;
+    replaceOfferRates = applicationDb.replaceOfferRates;
   }, 60_000);
 
   afterAll(async () => {
@@ -245,5 +260,28 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity [executable]", () => {
 
     expect(snapshot((await offerRows())[0])).toEqual(offerBefore);
     expect(await rateRows(offerId)).toHaveLength(0);
+  });
+  it("Test D6 — replaceOfferRates: a failing rate INSERT leaves the whole price table intact", async () => {
+    const offerId = await seedOffer();
+    await seedRate(offerId);
+    await seedSecondRate(offerId);
+
+    const ratesBefore = await orderedRates(offerId);
+    const offerBefore = snapshot((await offerRows())[0]);
+    expect(ratesBefore).toHaveLength(2);
+
+    // replaceOfferRates DELETEs every row before inserting the submitted set, so without the
+    // transaction this call would leave the offer with no rate periods at all — and a published
+    // offer carrying no current rate is withheld from both public read paths, which would remove
+    // the product from the catalogue entirely.
+    await expectSentinelRejection(
+      replaceOfferRates(offerId, [
+        { occupancy: "per_person", price: SENTINEL_REJECTED_PRICE, labelEn: "Should not persist" },
+      ]),
+    );
+
+    expect(await orderedRates(offerId)).toEqual(ratesBefore);
+    // lastPriceUpdatedAt must not advance either: the timestamp update is in the same transaction.
+    expect(snapshot((await offerRows())[0])).toEqual(offerBefore);
   });
 });

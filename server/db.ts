@@ -312,14 +312,32 @@ export async function updateOfferMedia(id: number, patch: Pick<typeof travelOffe
 
 export type AdminRateInput = { labelEn?: string; labelAr?: string; occupancy: string; price: string; childPrice?: string; infantPrice?: string; validFrom?: Date; validUntil?: Date; notesEn?: string; notesAr?: string };
 
-/** Replace staff-entered hotel rate periods atomically so an offer never exposes a partially edited public price table. */
+/**
+ * Replace staff-entered hotel rate periods atomically so an offer never exposes a partially edited
+ * public price table.
+ *
+ * The DELETE, the INSERT and the headline-timestamp UPDATE are one transaction (D6). Before that
+ * they were three separate auto-committed statements, and the DELETE removed every rate row before
+ * the INSERT was attempted: a failure in between destroyed the offer's entire price table. Because a
+ * published offer carrying no current rate is withheld from both public read paths, the offer then
+ * vanished from the site rather than showing a stale price, so a transient failure during an
+ * ordinary price edit silently removed a product from the catalogue.
+ *
+ * Scope limit, as with saveAdminOffer: this makes the operation all-or-nothing. It does not
+ * serialise this function against a concurrent saveAdminOffer, whose headline-price rules read the
+ * same rows; closing that race needs locking semantics that are unverified on TiDB and is tracked as
+ * deferred coverage in server/lifecycle.integration.test.ts.
+ */
 export async function replaceOfferRates(offerId: number, rates: AdminRateInput[]) {
   const db = await getDb();
   if (!db) throw new Error("The offer service is unavailable.");
-  await db.delete(offerRatePeriods).where(eq(offerRatePeriods.offerId, offerId));
-  if (rates.length) await db.insert(offerRatePeriods).values(rates.map((rate) => ({ offerId, labelEn: rate.labelEn || null, labelAr: rate.labelAr || null, occupancy: rate.occupancy, price: rate.price, currency: "EGP", childPrice: rate.childPrice || null, infantPrice: rate.infantPrice || null, validFrom: rate.validFrom ?? null, validUntil: rate.validUntil ?? null, notesEn: rate.notesEn || null, notesAr: rate.notesAr || null, lastUpdatedAt: new Date() })));
-  await db.update(travelOffers).set({ lastPriceUpdatedAt: new Date() }).where(eq(travelOffers.id, offerId));
-  return { success: true };
+
+  return db.transaction(async (tx) => {
+    await tx.delete(offerRatePeriods).where(eq(offerRatePeriods.offerId, offerId));
+    if (rates.length) await tx.insert(offerRatePeriods).values(rates.map((rate) => ({ offerId, labelEn: rate.labelEn || null, labelAr: rate.labelAr || null, occupancy: rate.occupancy, price: rate.price, currency: "EGP", childPrice: rate.childPrice || null, infantPrice: rate.infantPrice || null, validFrom: rate.validFrom ?? null, validUntil: rate.validUntil ?? null, notesEn: rate.notesEn || null, notesAr: rate.notesAr || null, lastUpdatedAt: new Date() })));
+    await tx.update(travelOffers).set({ lastPriceUpdatedAt: new Date() }).where(eq(travelOffers.id, offerId));
+    return { success: true };
+  });
 }
 
 export async function listAdminUmrahPrograms() {
