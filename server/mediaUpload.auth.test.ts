@@ -15,7 +15,15 @@ const putMedia = vi.fn(async () => ({ key: "k", url: "/media/k" }));
 
 vi.mock("./_core/mediaStorage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./_core/mediaStorage")>();
-  return { ...actual, putMedia: (...args: unknown[]) => putMedia(...(args as [])) };
+  return {
+    ...actual,
+    // The router now refuses an upload before decoding the bytes when no storage backend is
+    // configured, and the test environment configures none. Reported as configured here so these
+    // cases still exercise what they are about — the authorization gate and the server-chosen key.
+    // server/mediaUpload.config.test.ts covers the unconfigured refusal.
+    isR2Configured: () => true,
+    putMedia: (...args: unknown[]) => putMedia(...(args as [])),
+  };
 });
 
 import { appRouter } from "./routers";

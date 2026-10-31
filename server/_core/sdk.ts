@@ -200,7 +200,9 @@ class SDKServer {
     cookieValue: string | undefined | null
   ): Promise<{ openId: string; appId: string; name: string } | null> {
     if (!cookieValue) {
-      console.warn("[Auth] Missing session cookie");
+      // No cookie is the ordinary state of a signed-out visitor: every public page calls auth.me
+      // once, so warning here printed a line per anonymous request and buried the warnings that do
+      // mean something. A cookie that is present and fails below is still reported.
       return null;
     }
 

@@ -42,9 +42,39 @@ async function serveFromR2(key: string, res: Response) {
  * The previous behaviour: ask Manus Forge to presign a GET and redirect to it. Reached only when R2
  * is not configured.
  */
+/**
+ * The "no backend configured" notice is printed once per process rather than once per request.
+ *
+ * The static brand and editorial images are still referenced under /manus-storage/, so an
+ * unconfigured deployment logged this line several times on every page load — tens of thousands of
+ * identical lines that drown the host's log and hide real errors. Nothing is lost: the condition is
+ * a configuration state, not an event, so one line plus the suppressed count says the same thing.
+ */
+let unconfiguredNotices = 0;
+function noteUnconfiguredBackend() {
+  unconfiguredNotices += 1;
+  if (unconfiguredNotices === 1) {
+    console.error(
+      "[Media] no media backend configured: set the R2 variables (see .env.example). " +
+        "Requests under /media/ and /manus-storage/ will answer 503 until then; this notice is " +
+        "printed once per process."
+    );
+  }
+}
+
+/** Test-only: forget that the notice has been printed. */
+export function resetMediaBackendNotice(): void {
+  unconfiguredNotices = 0;
+}
+
+/** How many requests have hit the unconfigured-backend path since the process started. */
+export function unconfiguredBackendRequestCount(): number {
+  return unconfiguredNotices;
+}
+
 async function serveFromForge(key: string, res: Response) {
   if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
-    console.error("[Media] no media backend configured: set the R2 variables (see .env.example)");
+    noteUnconfiguredBackend();
     res.status(503).send("Media storage is not configured");
     return;
   }

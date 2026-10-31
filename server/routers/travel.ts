@@ -4,7 +4,8 @@
 import { z } from "zod";
 import { adminProcedure, publicProcedure, router } from "../_core/trpc";
 import { createEnquiry, getPublicCampaigns, getPublicOfferBySlug, getPublicSettings, getPublicUmrahProgramBySlug, listAdminOffers, listAdminUmrahPrograms, listPublicOffers, listPublicUmrahPrograms, replaceOfferRates, replaceUmrahRates, saveAdminOffer, saveAdminUmrahProgram, updateOfferMedia, updateOfferStatus, updateUmrahStatus } from "../db";
-import { MAX_MEDIA_BYTES, offerImageKey, putMedia, type MediaContentType } from "../_core/mediaStorage";
+import { MAX_MEDIA_BYTES, isR2Configured, offerImageKey, putMedia, r2ConfigError, type MediaContentType } from "../_core/mediaStorage";
+import { MEDIA_STORAGE_UNCONFIGURED_ERR_MSG } from "@shared/const";
 
 const availabilityValues = ["available", "limited", "on_request", "sold_out", "expired", "hidden"] as const;
 
@@ -64,6 +65,14 @@ export const travelRouter = router({
      * server-side. putMedia then re-checks the size, the type and the bytes themselves.
      */
     uploadOfferImage: adminProcedure.input(z.object({ offerId: z.number().int().positive(), filename: z.string().min(1).max(160), contentType: z.enum(["image/jpeg", "image/png", "image/webp"]), base64: z.string().min(32).max(7_000_000) })).mutation(async ({ input }) => {
+      // Checked before the bytes are decoded so an unconfigured deployment answers with a message
+      // the operator can act on. Without this the failure came out of the S3 client as text naming
+      // the missing environment variables, which the dashboard is obliged to suppress — so the
+      // upload button simply reported "the image could not be uploaded" with no reason.
+      if (!isR2Configured()) {
+        console.error(`[Media] admin upload refused: ${r2ConfigError()}`);
+        throw new Error(MEDIA_STORAGE_UNCONFIGURED_ERR_MSG);
+      }
       const rawBase64 = input.base64.replace(/^data:image\/(jpeg|png|webp);base64,/, "");
       const bytes = Buffer.from(rawBase64, "base64");
       if (!bytes.length || bytes.length > MAX_MEDIA_BYTES) throw new Error(`Image must be a non-empty file up to ${Math.floor(MAX_MEDIA_BYTES / (1024 * 1024))} MB.`);
@@ -71,6 +80,12 @@ export const travelRouter = router({
       const stored = await putMedia({ key: offerImageKey(input.offerId, contentType), bytes, contentType });
       return { url: stored.url };
     }),
+    /**
+     * Whether image uploads are available, so the dashboard can explain an unconfigured deployment
+     * up front instead of letting the operator pick a file and then fail. Reports only the
+     * availability flag — the configuration error names environment variables and stays in the log.
+     */
+    mediaStatus: adminProcedure.query(() => ({ uploadsEnabled: isR2Configured() })),
     umrahPrograms: adminProcedure.query(() => listAdminUmrahPrograms()),
     saveUmrahProgram: adminProcedure.input(adminUmrahSchema).mutation(({ input }) => saveAdminUmrahProgram(input)),
     updateUmrahStatus: adminProcedure.input(z.object({ id: z.number().int().positive(), isActive: z.boolean().optional(), availability: z.enum(availabilityValues).optional() }).refine((data) => data.isActive !== undefined || data.availability !== undefined, { message: "Choose at least one field to update." })).mutation(({ input }) => updateUmrahStatus(input.id, { isActive: input.isActive, availability: input.availability })),
