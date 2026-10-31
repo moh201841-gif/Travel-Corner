@@ -1,0 +1,156 @@
+name: Database migration (manual)
+
+# Applies the committed Drizzle migrations to the managed MySQL database.
+#
+# Render's free plan has no Pre-Deploy Command, so migrations run from here instead. This is
+# deliberately a separate workflow from ci.yml: nothing about it is automatic, and it must never be
+# able to ride along with a test run.
+#
+# Four things keep an accidental run from happening:
+#   - workflow_dispatch is the only trigger — no push, no pull_request, no schedule;
+#   - the `confirm` input has to be typed as MIGRATE, which defeats a mis-click in the Actions UI;
+#   - the job runs in the production-db Environment, so its secrets are unreadable from any other
+#     workflow and a reviewer requirement on that Environment pauses the run until a human approves;
+#   - concurrency queues rather than cancels, because an interrupted migration is the worst case.
+#
+# Re-running is safe. drizzle records a watermark row in __drizzle_migrations and skips every
+# migration already applied, so a second dispatch applies nothing.
+#
+# MySQL DDL does not roll back, and the committed migrations do not use IF NOT EXISTS. If a run fails
+# part way the schema is left half-applied with no watermark row written, and the next run will retry
+# the whole file and stop on an "already exists" error. That needs manual repair — so do not cancel a
+# run in progress, and read the log before re-dispatching after a failure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type MIGRATE to confirm you intend to change the production database'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a migration that is already running: an interrupted run leaves partial DDL behind.
+  group: db-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Apply committed migrations
+    runs-on: ubuntu-latest
+    # Holds DATABASE_URL and AIVEN_CA_PEM. Add required reviewers to this Environment to make every
+    # run wait for a human approval.
+    environment: production-db
+    # Long enough for the committed migration set many times over; short enough that a hung run does
+    # not hold the concurrency slot for hours.
+    timeout-minutes: 15
+    steps:
+      - name: Require an explicit confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "MIGRATE" ]; then
+            echo "::error::Confirmation failed. Type MIGRATE exactly to run this workflow." >&2
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        # drizzle-kit is a devDependency, so the full install is required; --prod would omit it.
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the required secrets are present
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AIVEN_CA_PEM: ${{ secrets.AIVEN_CA_PEM }}
+        run: |
+          # Presence only — the values are never printed, compared in the log, or written anywhere.
+          missing=""
+          [ -n "$DATABASE_URL" ] || missing="$missing DATABASE_URL"
+          [ -n "$AIVEN_CA_PEM" ] || missing="$missing AIVEN_CA_PEM"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secret(s) in the production-db environment:$missing" >&2
+            exit 1
+          fi
+          echo "Both secrets are present."
+
+      - name: Write the CA certificate and point DATABASE_CA_PATH at it
+        env:
+          AIVEN_CA_PEM: ${{ secrets.AIVEN_CA_PEM }}
+        run: |
+          # The certificate reaches this step through env, never through command-line interpolation,
+          # and is only ever redirected to a file — GitHub's log masking is unreliable for multi-line
+          # values such as a PEM, so it is never echoed.
+          #
+          # RUNNER_TEMP is outside the checkout, so the file cannot be committed or picked up by an
+          # artifact upload. umask 077 keeps it readable only by the runner user.
+          umask 077
+          ca_path="$RUNNER_TEMP/aiven-ca.pem"
+          printf '%s\n' "$AIVEN_CA_PEM" > "$ca_path"
+          echo "DATABASE_CA_PATH=$ca_path" >> "$GITHUB_ENV"
+          echo "Wrote the CA certificate to \$RUNNER_TEMP/aiven-ca.pem"
+
+      - name: Verify the CA file before connecting
+        run: |
+          # TLS is opt-in in drizzle.config.ts: with DATABASE_CA_PATH unset it would attempt an
+          # unverified connection. This step is what makes TLS mandatory for this workflow.
+          if [ -z "${DATABASE_CA_PATH:-}" ]; then
+            echo "::error::DATABASE_CA_PATH is not set; refusing to migrate without TLS verification." >&2
+            exit 1
+          fi
+          if [ ! -s "$DATABASE_CA_PATH" ]; then
+            echo "::error::The CA file at \$DATABASE_CA_PATH is missing or empty." >&2
+            exit 1
+          fi
+          # Structural check only; no certificate content is printed. server/databaseSsl.ts parses it
+          # properly with X509Certificate and fails closed on anything unusable.
+          if ! grep -q -- '-----BEGIN CERTIFICATE-----' "$DATABASE_CA_PATH" \
+            || ! grep -q -- '-----END CERTIFICATE-----' "$DATABASE_CA_PATH"; then
+            echo "::error::The CA file does not contain a PEM certificate." >&2
+            exit 1
+          fi
+          echo "CA file present and PEM-shaped ($(wc -c < "$DATABASE_CA_PATH") bytes)."
+
+      - name: Record what is being applied
+        run: |
+          {
+            echo "### Database migration"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Dispatched by | @${GITHUB_ACTOR} |"
+            echo "| Run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo
+            echo "Migrations committed at this SHA:"
+            echo
+            for f in drizzle/*.sql; do echo "- \`$(basename "$f")\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Applying migrations from $GITHUB_SHA"
+
+      - name: Apply migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # DATABASE_CA_PATH comes from $GITHUB_ENV, set two steps above. drizzle.config.ts reads it
+          # at module load and, through server/databaseSsl.ts, requires TLS >= 1.2, verifies the chain
+          # against this CA (rejectUnauthorized) and verifies the certificate was issued for the
+          # hostname in DATABASE_URL (verifyIdentity). An unreadable or invalid certificate, an IP
+          # address in place of a hostname, or an ssl-mode style query parameter all fail closed.
+          TZ: UTC
+        run: pnpm db:migrate
