@@ -9,6 +9,7 @@ import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { registerAdminAuthRoutes } from "./adminAuth";
 import { parsePort, shouldScanForPort } from "./port";
+import { assertDatabaseTlsConfiguration } from "../databaseSsl";
 import { serveStatic } from "./serveStatic";
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -72,5 +73,11 @@ async function startServer() {
     console.log(`Server running on port ${port}`);
   });
 }
+
+// Fail the deploy, not individual requests: the database pool is built lazily and the health check
+// path is static, so a bad CA — or an SSL parameter the driver would ignore and downgrade to
+// plaintext — must stop the process here. Deliberately outside startServer(), because the catch
+// below reports an error and still exits 0, which would look like a clean start to the host.
+assertDatabaseTlsConfiguration();
 
 startServer().catch(console.error);
