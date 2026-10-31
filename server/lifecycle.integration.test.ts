@@ -30,6 +30,7 @@ import {
   setupIntegrationDatabase,
   SENTINEL_CONSTRAINT_NAME,
   SENTINEL_REJECTED_PRICE,
+  SENTINEL_UMRAH_CONSTRAINT_NAME,
   type IntegrationDatabase,
 } from "./testDatabase";
 
@@ -51,7 +52,6 @@ const BLOCKED_COVERAGE = [
   "saveAdminOffer success commits the offer and its headline rate together, and the returned id resolves (Finding 2)",
   "saveAdminOffer leaves validFrom/validUntil on the touched rate row untouched on both the success and the rollback path (Finding 2)",
   "saveAdminOffer versus a concurrent replaceOfferRates: the D9 refusal is not bypassed and no rate row is overwritten arbitrarily (Finding 2 — concurrency; a transaction alone does not close this race, and the required locking semantics are unverified on TiDB)",
-  "replaceUmrahRates rolls back completely on a mid-operation failure (D7 — blocked)",
   "rate reconciliation preserves childPrice, infantPrice and bilingual notes (D8 — blocked)",
 ];
 
@@ -102,6 +102,7 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
   let database: IntegrationDatabase;
   let saveAdminOffer: typeof import("./db")["saveAdminOffer"];
   let replaceOfferRates: typeof import("./db")["replaceOfferRates"];
+  let replaceUmrahRates: typeof import("./db")["replaceUmrahRates"];
   let applicationDb: typeof import("./db");
 
   const baseInput = {
@@ -176,16 +177,19 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
    * never exercised rollback at all. Matching the root cause, and the constraint by name, makes the
    * injected failure the only thing these tests can be satisfied by.
    */
-  async function expectSentinelRejection(call: Promise<unknown>): Promise<void> {
+  async function expectSentinelRejection(
+    call: Promise<unknown>,
+    constraintName: string = SENTINEL_CONSTRAINT_NAME,
+  ): Promise<void> {
     const error = await call.then(
       () => null,
       (caught: unknown) => caught,
     );
 
-    expect(error, "saveAdminOffer resolved: the sentinel rate write did not fail").not.toBeNull();
+    expect(error, "the call resolved: the sentinel rate write did not fail").not.toBeNull();
     const cause = rootCauseMessage(error);
     expect(cause).toMatch(/check constraint/i);
-    expect(cause).toContain(SENTINEL_CONSTRAINT_NAME);
+    expect(cause).toContain(constraintName);
   }
 
   async function seedSecondRate(offerId: number): Promise<void> {
@@ -202,11 +206,53 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
     return rows.sort((left, right) => Number(left.id) - Number(right.id)).map(snapshot);
   }
 
+  const FIXTURE_PROGRAM_UPDATED_AT = "2026-04-01 09:00:00";
+
+  const umrahSlug = "integration-umrah-ramadan";
+
+  const programRows = () =>
+    database.query<Record<string, unknown>>("SELECT * FROM `umrahPrograms` WHERE `slug` = ?", [umrahSlug]);
+
+  const umrahRateRowsFor = (programId: number) =>
+    database.query<Record<string, unknown>>("SELECT * FROM `umrahRateRows` WHERE `programId` = ?", [programId]);
+
+  /** Rows ordered by id, so a deep comparison across a rollback is stable. */
+  async function orderedUmrahRates(programId: number) {
+    const rows = await umrahRateRowsFor(programId);
+    return rows.sort((left, right) => Number(left.id) - Number(right.id)).map(snapshot);
+  }
+
+  /** Seed a program directly, so the fixture does not depend on the function under test. */
+  async function seedUmrahProgram(): Promise<number> {
+    await database.query(
+      "INSERT INTO `umrahPrograms` (`slug`, `titleEn`, `titleAr`, `availability`, `isActive`, `airline`, `departureAt`, `lastUpdatedAt`) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [umrahSlug, "Ramadan Umrah", "عمرة رمضان", "limited", 1, "EgyptAir", "2027-02-20 00:00:00", FIXTURE_PROGRAM_UPDATED_AT],
+    );
+    const rows = await programRows();
+    return Number(rows[0].id);
+  }
+
+  /** Three occupancies, so losing a whole room-type price list is observable. */
+  async function seedUmrahRates(programId: number): Promise<void> {
+    for (const [roomType, price, notesEn, notesAr] of [
+      ["Quad", "37500.00", "Four per room", "أربعة في الغرفة"],
+      ["Triple", "42000.00", "Three per room", "ثلاثة في الغرفة"],
+      ["Double", "48000.00", null, null],
+    ] as Array<[string, string, string | null, string | null]>) {
+      await database.query(
+        "INSERT INTO `umrahRateRows` (`programId`, `roomType`, `price`, `currency`, `notesEn`, `notesAr`) VALUES (?, ?, ?, ?, ?, ?)",
+        [programId, roomType, price, "EGP", notesEn, notesAr],
+      );
+    }
+  }
+
   beforeAll(async () => {
     database = await setupIntegrationDatabase();
     applicationDb = await importApplicationDb(database);
     saveAdminOffer = applicationDb.saveAdminOffer;
     replaceOfferRates = applicationDb.replaceOfferRates;
+    replaceUmrahRates = applicationDb.replaceUmrahRates;
   }, 60_000);
 
   afterAll(async () => {
@@ -283,5 +329,26 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
     expect(await orderedRates(offerId)).toEqual(ratesBefore);
     // lastPriceUpdatedAt must not advance either: the timestamp update is in the same transaction.
     expect(snapshot((await offerRows())[0])).toEqual(offerBefore);
+  });
+  it("Test D7 — replaceUmrahRates: a failing occupancy INSERT leaves the whole room-type list intact", async () => {
+    const programId = await seedUmrahProgram();
+    await seedUmrahRates(programId);
+
+    const ratesBefore = await orderedUmrahRates(programId);
+    const programBefore = snapshot((await programRows())[0]);
+    expect(ratesBefore).toHaveLength(3);
+    expect(ratesBefore.map((rate) => rate.roomType)).toEqual(["Quad", "Triple", "Double"]);
+
+    // replaceUmrahRates DELETEs every occupancy row before inserting the submitted set. Without the
+    // transaction this call would leave the program with no rates at all — and the public Umrah
+    // listing does not withhold a rate-less program, so it would stay visible showing no prices.
+    await expectSentinelRejection(
+      replaceUmrahRates(programId, [{ roomType: "Quad", price: SENTINEL_REJECTED_PRICE }]),
+      SENTINEL_UMRAH_CONSTRAINT_NAME,
+    );
+
+    expect(await orderedUmrahRates(programId)).toEqual(ratesBefore);
+    // lastUpdatedAt must not advance either: the program timestamp update is in the same transaction.
+    expect(snapshot((await programRows())[0])).toEqual(programBefore);
   });
 });

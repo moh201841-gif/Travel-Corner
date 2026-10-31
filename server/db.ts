@@ -377,12 +377,27 @@ export async function updateUmrahStatus(id: number, patch: Pick<typeof umrahProg
 
 export type AdminUmrahRateInput = { roomType: string; price: string; notesEn?: string; notesAr?: string };
 
-/** Replace staff-managed Umrah occupancy rates atomically so every program keeps a complete, ordered price list. */
+/**
+ * Replace staff-managed Umrah occupancy rates atomically so every program keeps a complete, ordered
+ * price list.
+ *
+ * The DELETE, the INSERT and the program timestamp UPDATE are one transaction (D7). Before that they
+ * were three separate auto-committed statements, and the DELETE removed every occupancy row before
+ * the INSERT was attempted: a failure in between destroyed the program's whole room-type price list.
+ * The public Umrah listing does not withhold a program that has no rates, so the program stayed
+ * visible to customers showing no prices at all.
+ *
+ * Same scope limit as replaceOfferRates: this makes the operation all-or-nothing, and does not
+ * serialise it against a concurrent saveAdminUmrahProgram.
+ */
 export async function replaceUmrahRates(programId: number, rates: AdminUmrahRateInput[]) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
-  await db.delete(umrahRateRows).where(eq(umrahRateRows.programId, programId));
-  if (rates.length) await db.insert(umrahRateRows).values(rates.map((rate) => ({ programId, roomType: rate.roomType, price: rate.price, currency: "EGP", notesEn: rate.notesEn || null, notesAr: rate.notesAr || null })));
-  await db.update(umrahPrograms).set({ lastUpdatedAt: new Date() }).where(eq(umrahPrograms.id, programId));
-  return { success: true };
+
+  return db.transaction(async (tx) => {
+    await tx.delete(umrahRateRows).where(eq(umrahRateRows.programId, programId));
+    if (rates.length) await tx.insert(umrahRateRows).values(rates.map((rate) => ({ programId, roomType: rate.roomType, price: rate.price, currency: "EGP", notesEn: rate.notesEn || null, notesAr: rate.notesAr || null })));
+    await tx.update(umrahPrograms).set({ lastUpdatedAt: new Date() }).where(eq(umrahPrograms.id, programId));
+    return { success: true };
+  });
 }

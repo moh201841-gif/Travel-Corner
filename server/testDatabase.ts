@@ -40,6 +40,9 @@ export const SENTINEL_REJECTED_PRICE = "6666.00";
 /** Name of the CHECK constraint that rejects SENTINEL_REJECTED_PRICE, asserted on by the tests. */
 export const SENTINEL_CONSTRAINT_NAME = "travelcorner_test_rate_write_sentinel";
 
+/** The same injection for umrahRateRows, so an Umrah rate write can be failed server-side as well. */
+export const SENTINEL_UMRAH_CONSTRAINT_NAME = "travelcorner_test_umrah_rate_write_sentinel";
+
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 const MIGRATIONS = ["0000_giant_betty_ross.sql", "0001_thankful_sentinels.sql"];
@@ -156,7 +159,7 @@ async function assertUtcSession(connection: Connection): Promise<void> {
 }
 
 /** Tables this harness seeds and clears. Ordered so child rows go before their parents. */
-const SEEDED_TABLES = ["offerRatePeriods", "travelOffers"] as const;
+const SEEDED_TABLES = ["offerRatePeriods", "travelOffers", "umrahRateRows", "umrahPrograms"] as const;
 
 /**
  * Create a uniquely named disposable database, apply the committed migrations to it, install the
@@ -208,6 +211,9 @@ export async function setupIntegrationDatabase(): Promise<IntegrationDatabase> {
     // non-atomic implementation observable.
     await admin.query(
       `ALTER TABLE \`offerRatePeriods\` ADD CONSTRAINT \`${SENTINEL_CONSTRAINT_NAME}\` CHECK (\`price\` <> ${SENTINEL_REJECTED_PRICE})`,
+    );
+    await admin.query(
+      `ALTER TABLE \`umrahRateRows\` ADD CONSTRAINT \`${SENTINEL_UMRAH_CONSTRAINT_NAME}\` CHECK (\`price\` <> ${SENTINEL_REJECTED_PRICE})`,
     );
   } catch (error) {
     if (created) {
