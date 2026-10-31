@@ -18,10 +18,12 @@
  *     sdk.authenticateRequest falls back to syncing the user from the OAuth server when the row is
  *     missing, which would fail off-Manus. If the row cannot be persisted we refuse to issue a
  *     session rather than hand out a cookie that cannot authenticate.
- *   - Failed attempts are rate limited per client. The limiter is in-process, so it resets on
- *     restart and is per-instance; that is adequate for a single-admin deployment on one instance
- *     and is documented in .env.example.
+ *   - Failed attempts are rate limited per client, identified by clientKey below. Client identity
+ *     never comes from an unverified forwarding header; see that function for the proxy trust
+ *     model. The limiter is in-process, so it resets on restart and is per-instance; that is
+ *     adequate for a single-admin deployment on one instance and is documented in .env.example.
  */
+import { isIP } from "node:net";
 import type { Express, Request, Response } from "express";
 import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 import * as db from "../db";
@@ -45,14 +47,47 @@ type AttemptRecord = { failures: number; firstFailureAt: number; lockedUntil: nu
 
 const attempts = new Map<string, AttemptRecord>();
 
-/** Stable per-client key for rate limiting. Trusts the proxy's first forwarded hop when present. */
+/** Normalise one X-Forwarded-For entry to a bare address, or null when it is not an address. */
+function asAddress(entry: string): string | null {
+  if (isIP(entry)) return entry;
+  // Some proxies append a port, and IPv6 entries may be bracketed.
+  const bracketed = entry.match(/^\[(.+)\](?::\d+)?$/);
+  if (bracketed && isIP(bracketed[1]!)) return bracketed[1]!;
+  const withPort = entry.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
+  if (withPort && isIP(withPort[1]!)) return withPort[1]!;
+  return null;
+}
+
+/**
+ * Stable per-client key for rate limiting.
+ *
+ * X-Forwarded-For is append-only: each proxy adds the address it received the request from, so the
+ * right-hand entries are the ones written by infrastructure we control and everything to their left
+ * is supplied by the caller. Reading the leftmost entry — as this did before — let an attacker send
+ * a different spoofed value on every attempt, giving each one its own bucket and defeating the
+ * lockout entirely.
+ *
+ * ENV.trustedProxyHops says how many entries at the right-hand end were written by trusted proxies.
+ * It defaults to 0, which ignores the header completely and keys on the socket address, which a
+ * client cannot forge. That is fail-closed: see the operational note in .env.example, because behind
+ * a proxy it puts every client in one bucket.
+ */
 export function clientKey(req: Request): string {
+  const socketAddress = req.socket?.remoteAddress ?? "unknown";
+  const hops = ENV.trustedProxyHops;
+  if (hops <= 0) return socketAddress;
+
   const forwarded = req.headers["x-forwarded-for"];
-  const header = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  if (typeof header === "string" && header.trim() !== "") {
-    return header.split(",")[0]!.trim();
-  }
-  return req.ip ?? req.socket?.remoteAddress ?? "unknown";
+  const chain = (Array.isArray(forwarded) ? forwarded.join(",") : (forwarded ?? ""))
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+
+  // Fewer entries than expected means the request did not come through the configured proxies, so
+  // there is no entry we can trust: fall back to the address we observed ourselves.
+  if (chain.length < hops) return socketAddress;
+
+  return asAddress(chain[chain.length - hops]!) ?? socketAddress;
 }
 
 /** Remaining lockout in milliseconds, or 0 when the client may attempt a login. */

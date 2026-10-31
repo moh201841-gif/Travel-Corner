@@ -22,6 +22,22 @@ function readR2Endpoint(): string {
   return account ? `https://${account}.r2.cloudflarestorage.com` : "";
 }
 
+/**
+ * How many reverse proxies sit between a client and this process.
+ *
+ * X-Forwarded-For is appended to by each proxy, so only the right-hand entries were written by
+ * infrastructure we control; everything to the left of them is supplied by the caller. Reading the
+ * wrong end lets an attacker rotate a spoofed value and escape per-client rate limiting, so the
+ * default is 0: trust no forwarding header and identify clients by their socket address instead.
+ * Set it to 1 behind a single proxy such as Railway's edge.
+ */
+function readTrustedProxyHops(): number {
+  const raw = (process.env.TRUSTED_PROXY_HOPS ?? "").trim();
+  if (!/^\d+$/.test(raw)) return 0;
+  const hops = Number(raw);
+  return Number.isSafeInteger(hops) && hops >= 0 ? hops : 0;
+}
+
 export const ENV = {
   appId: process.env.VITE_APP_ID ?? "",
   cookieSecret: process.env.JWT_SECRET ?? "",
@@ -48,4 +64,6 @@ export const ENV = {
    * media route redirects to a short-lived signed URL instead.
    */
   r2PublicBaseUrl: (process.env.R2_PUBLIC_BASE_URL ?? "").trim().replace(/\/+$/, ""),
+  /** Trusted reverse-proxy hop count used to identify clients for rate limiting. 0 = trust none. */
+  trustedProxyHops: readTrustedProxyHops(),
 };

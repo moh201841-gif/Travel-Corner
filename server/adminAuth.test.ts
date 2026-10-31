@@ -171,10 +171,113 @@ describe("login rate limiting", () => {
     expect(lockoutRemainingMs(key)).toBe(0);
   });
 
-  it("derives the client key from the first forwarded hop, falling back to the socket", () => {
-    expect(clientKey({ headers: { "x-forwarded-for": "198.51.100.7, 10.0.0.1" } } as never)).toBe("198.51.100.7");
-    expect(clientKey({ headers: {}, ip: "198.51.100.8" } as never)).toBe("198.51.100.8");
+  it("keys on the socket address, ignoring forwarding headers, with no trusted proxy configured", () => {
+    expect(
+      clientKey({ headers: { "x-forwarded-for": "198.51.100.7, 10.0.0.1" }, socket: { remoteAddress: "10.1.1.1" } } as never)
+    ).toBe("10.1.1.1");
+    // req.ip is not trusted either: Express only populates it from the header when `trust proxy`
+    // is configured, which this app deliberately does not do.
+    expect(clientKey({ headers: {}, ip: "198.51.100.8", socket: { remoteAddress: "10.1.1.2" } } as never)).toBe("10.1.1.2");
     expect(clientKey({ headers: {} } as never)).toBe("unknown");
+  });
+
+  it("gives a rotating spoofed X-Forwarded-For one shared bucket, so the lockout cannot be escaped", () => {
+    // This is the bypass the previous implementation allowed: a fresh spoofed value per attempt
+    // produced a fresh bucket, so the counter never reached the limit.
+    const keys = new Set(
+      ["203.0.113.1", "203.0.113.2", "198.51.100.9", "", "not-an-ip"].map((spoofed) =>
+        clientKey({ headers: { "x-forwarded-for": spoofed }, socket: { remoteAddress: "10.2.2.2" } } as never)
+      )
+    );
+
+    expect(keys).toEqual(new Set(["10.2.2.2"]));
+  });
+});
+
+describe("client identification behind a trusted proxy", () => {
+  /** clientKey reads ENV once at import, so each hop setting needs a fresh module generation. */
+  async function withHops(hops: string | undefined) {
+    vi.resetModules();
+    if (hops === undefined) delete process.env.TRUSTED_PROXY_HOPS;
+    else process.env.TRUSTED_PROXY_HOPS = hops;
+    const mod = await import("./_core/adminAuth");
+    return mod.clientKey;
+  }
+
+  const socket = { remoteAddress: "10.0.0.254" };
+
+  afterEach(() => {
+    delete process.env.TRUSTED_PROXY_HOPS;
+  });
+
+  it("reads the hop the trusted proxy appended, not the caller's own entry", async () => {
+    const key = await withHops("1");
+
+    // The proxy appends the address it saw, so the real client is the right-hand entry.
+    expect(key({ headers: { "x-forwarded-for": "203.0.113.9" }, socket } as never)).toBe("203.0.113.9");
+    expect(key({ headers: { "x-forwarded-for": "1.2.3.4, 203.0.113.9" }, socket } as never)).toBe("203.0.113.9");
+  });
+
+  it("is unmoved by however much a caller prepends", async () => {
+    const key = await withHops("1");
+
+    // Whatever the attacker sends, the proxy's own entry stays last, so the bucket does not change.
+    const keys = new Set(
+      [
+        "203.0.113.9",
+        "1.2.3.4, 203.0.113.9",
+        "9.9.9.9, 8.8.8.8, 7.7.7.7, 203.0.113.9",
+        "not-an-ip, , 203.0.113.9",
+      ].map((chain) => key({ headers: { "x-forwarded-for": chain }, socket } as never))
+    );
+
+    expect(keys).toEqual(new Set(["203.0.113.9"]));
+  });
+
+  it("counts hops from the right, so a deeper chain still resolves the client", async () => {
+    const key = await withHops("2");
+
+    expect(key({ headers: { "x-forwarded-for": "1.2.3.4, 203.0.113.9, 10.0.0.2" }, socket } as never)).toBe("203.0.113.9");
+  });
+
+  it("falls back to the socket address when the chain is shorter than the trusted hop count", async () => {
+    const key = await withHops("2");
+
+    // Fewer entries than configured means the request did not arrive through those proxies.
+    expect(key({ headers: { "x-forwarded-for": "203.0.113.9" }, socket } as never)).toBe("10.0.0.254");
+    expect(key({ headers: {}, socket } as never)).toBe("10.0.0.254");
+  });
+
+  it("falls back to the socket address when the trusted entry is not an address", async () => {
+    const key = await withHops("1");
+
+    for (const chain of ["garbage", "1.2.3.4, localhost", "1.2.3.4, 999.999.999.999", "1.2.3.4, <script>"]) {
+      expect(key({ headers: { "x-forwarded-for": chain }, socket } as never), chain).toBe("10.0.0.254");
+    }
+  });
+
+  it("normalises a port suffix and a bracketed IPv6 entry", async () => {
+    const key = await withHops("1");
+
+    expect(key({ headers: { "x-forwarded-for": "203.0.113.9:51234" }, socket } as never)).toBe("203.0.113.9");
+    expect(key({ headers: { "x-forwarded-for": "[2001:db8::1]:443" }, socket } as never)).toBe("2001:db8::1");
+    expect(key({ headers: { "x-forwarded-for": "2001:db8::1" }, socket } as never)).toBe("2001:db8::1");
+  });
+
+  it("handles a header delivered as repeated fields", async () => {
+    const key = await withHops("1");
+
+    expect(key({ headers: { "x-forwarded-for": ["1.2.3.4", "203.0.113.9"] }, socket } as never)).toBe("203.0.113.9");
+  });
+
+  it("treats an unusable TRUSTED_PROXY_HOPS as no trusted proxy at all", async () => {
+    for (const invalid of ["", "abc", "-1", "1.5", " "]) {
+      const key = await withHops(invalid);
+      expect(
+        key({ headers: { "x-forwarded-for": "203.0.113.9" }, socket } as never),
+        `TRUSTED_PROXY_HOPS=${JSON.stringify(invalid)} should not trust the header`
+      ).toBe("10.0.0.254");
+    }
   });
 });
 

@@ -52,6 +52,7 @@ const TOUCHED_ENV = [
   "OWNER_OPEN_ID",
   "SESSION_COOKIE_SAMESITE",
   "VITE_APP_ID",
+  "TRUSTED_PROXY_HOPS",
 ] as const;
 
 let savedEnv: Record<string, string | undefined>;
@@ -101,6 +102,8 @@ function baseEnv() {
     OWNER_OPEN_ID,
     VITE_APP_ID,
     SESSION_COOKIE_SAMESITE: undefined,
+    // Default: no trusted proxy, so forwarding headers are ignored entirely.
+    TRUSTED_PROXY_HOPS: undefined,
   };
 }
 
@@ -303,25 +306,83 @@ describe("administrator login route", () => {
     const app = await bootApp(baseEnv());
     try {
       const { MAX_FAILED_ATTEMPTS } = await import("./_core/adminAuth");
-      const client = { "x-forwarded-for": "198.51.100.42" };
 
       for (let attempt = 0; attempt < MAX_FAILED_ATTEMPTS; attempt += 1) {
-        const response = await login(app, { password: "wrong" }, client);
+        const response = await login(app, { password: "wrong" });
         expect(response.status).toBe(401);
       }
 
-      const locked = await login(app, { password: "wrong" }, client);
+      const locked = await login(app, { password: "wrong" });
       expect(locked.status).toBe(429);
       expect(Number(locked.headers.get("retry-after"))).toBeGreaterThan(0);
 
       // Even the correct password is refused while the lockout holds.
       getUserByOpenId.mockResolvedValue(ADMIN_ROW);
-      const correctButLocked = await login(app, { password: PASSWORD }, client);
+      const correctButLocked = await login(app, { password: PASSWORD });
       expect(correctButLocked.status).toBe(429);
       expect(correctButLocked.headers.getSetCookie()).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  }, 30_000);
 
-      // A different client is unaffected.
-      const otherClient = await login(app, { password: PASSWORD }, { "x-forwarded-for": "198.51.100.43" });
+  it("cannot be escaped by rotating a spoofed X-Forwarded-For on every attempt", async () => {
+    // The bypass this replaces: the limiter used to key on the leftmost forwarded entry, so a fresh
+    // spoofed value per request produced a fresh bucket and the counter never reached the limit.
+    const app = await bootApp(baseEnv());
+    try {
+      const { MAX_FAILED_ATTEMPTS } = await import("./_core/adminAuth");
+
+      for (let attempt = 0; attempt < MAX_FAILED_ATTEMPTS; attempt += 1) {
+        const response = await login(
+          app,
+          { password: "wrong" },
+          { "x-forwarded-for": `203.0.113.${attempt + 1}` }
+        );
+        expect(response.status).toBe(401);
+      }
+
+      // A sixth attempt under a brand-new spoofed identity is still refused.
+      const locked = await login(app, { password: "wrong" }, { "x-forwarded-for": "198.51.100.200" });
+      expect(locked.status).toBe(429);
+
+      // So is the correct password, and no header shape gets around it.
+      getUserByOpenId.mockResolvedValue(ADMIN_ROW);
+      for (const spoofed of ["9.9.9.9", "1.2.3.4, 5.6.7.8", "not-an-ip", ""]) {
+        const attempt = await login(app, { password: PASSWORD }, { "x-forwarded-for": spoofed });
+        expect(attempt.status, `spoofing ${JSON.stringify(spoofed)} should not reset the lockout`).toBe(429);
+        expect(attempt.headers.getSetCookie()).toEqual([]);
+      }
+    } finally {
+      await app.close();
+    }
+  }, 30_000);
+
+  it("restores per-client limiting when a trusted proxy hop is configured", async () => {
+    // With TRUSTED_PROXY_HOPS=1 the right-hand entry is the address the proxy recorded, so two
+    // genuinely different clients get their own buckets while prepended values are still ignored.
+    const app = await bootApp({ ...baseEnv(), TRUSTED_PROXY_HOPS: "1" });
+    try {
+      const { MAX_FAILED_ATTEMPTS } = await import("./_core/adminAuth");
+      const viaProxy = (clientIp: string, prepended = "") => ({
+        "x-forwarded-for": prepended ? `${prepended}, ${clientIp}` : clientIp,
+      });
+
+      for (let attempt = 0; attempt < MAX_FAILED_ATTEMPTS; attempt += 1) {
+        // The attacker varies what they prepend; the proxy's entry stays last.
+        const response = await login(app, { password: "wrong" }, viaProxy("198.51.100.42", `10.0.0.${attempt}`));
+        expect(response.status).toBe(401);
+      }
+
+      const locked = await login(app, { password: "wrong" }, viaProxy("198.51.100.42", "9.9.9.9"));
+      expect(locked.status).toBe(429);
+
+      getUserByOpenId.mockResolvedValue(ADMIN_ROW);
+      const sameClient = await login(app, { password: PASSWORD }, viaProxy("198.51.100.42"));
+      expect(sameClient.status).toBe(429);
+
+      // A different real client is unaffected.
+      const otherClient = await login(app, { password: PASSWORD }, viaProxy("198.51.100.43"));
       expect(otherClient.status).toBe(200);
     } finally {
       await app.close();

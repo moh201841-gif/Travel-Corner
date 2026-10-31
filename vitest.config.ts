@@ -12,8 +12,18 @@ export default defineConfig({
       "@assets": path.resolve(templateRoot, "attached_assets"),
     },
   },
+  // tsconfig sets jsx: "preserve" for the Vite build, which uses @vitejs/plugin-react. Vitest
+  // transforms with esbuild instead, so it needs to be told to use the automatic JSX runtime —
+  // otherwise JSX in components and tests compiles to a bare React.createElement reference.
+  esbuild: { jsx: "automatic" },
   test: {
     environment: "node",
-    include: ["server/**/*.test.ts", "server/**/*.spec.ts", "client/**/*.test.ts", "client/**/*.spec.ts"],
+    include: [
+      "server/**/*.test.ts",
+      "server/**/*.spec.ts",
+      "client/**/*.test.ts",
+      "client/**/*.test.tsx",
+      "client/**/*.spec.ts",
+    ],
   },
 });
