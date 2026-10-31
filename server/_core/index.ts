@@ -9,7 +9,7 @@ import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { registerAdminAuthRoutes } from "./adminAuth";
 import { parsePort, shouldScanForPort } from "./port";
-import { serveStatic, setupVite } from "./vite";
+import { serveStatic } from "./serveStatic";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -49,8 +49,11 @@ async function startServer() {
       createContext,
     })
   );
-  // development mode uses Vite, production mode uses static files
+  // development mode uses Vite, production mode uses static files.
+  // ./vite is imported dynamically so the production bundle never loads `vite` or the dev-only
+  // plugins, and can therefore run from a production-only dependency install.
   if (process.env.NODE_ENV === "development") {
+    const { setupVite } = await import("./vite");
     await setupVite(app, server);
   } else {
     serveStatic(app);
