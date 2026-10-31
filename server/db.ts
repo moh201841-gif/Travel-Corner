@@ -1,6 +1,6 @@
 import { and, asc, eq, gte, inArray, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG } from "@shared/const";
+import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG, MULTI_RATE_UMRAH_PRICE_ERR_MSG } from "@shared/const";
 import { hasCurrentRatePeriod, isOfferPubliclyVisible, isRatePeriodCurrent, isUmrahProgramPubliclyVisible, shouldAutoExpireOffer, shouldAutoExpireUmrahProgram } from "@shared/lifecycle";
 import { campaigns, enquiries, InsertUser, offerRatePeriods, siteSettings, travelOffers, umrahPrograms, umrahRateRows, users } from "../drizzle/schema";
 import { ENV } from './_core/env';
@@ -351,21 +351,53 @@ export async function listAdminUmrahPrograms() {
 
 export type AdminUmrahInput = { id?: number; slug: string; titleEn: string; titleAr: string; departureAt?: Date; returnAt?: Date; durationDays?: number; airline?: string; makkahHotelEn?: string; makkahHotelAr?: string; madinahHotelEn?: string; madinahHotelAr?: string; availability: "available" | "limited" | "on_request" | "sold_out" | "expired" | "hidden"; isActive: boolean; price?: string; roomType?: string };
 
-/** Create or update a structured Umrah program plus its headline occupancy rate. */
+/**
+ * Create or update a structured Umrah program plus its headline occupancy rate.
+ *
+ * Headline-price rules (D9-U), mirroring the offer editor:
+ *   0 rate rows → create exactly one
+ *   1 rate row  → update that row
+ *   2+ rate rows → refuse, because any choice would be a guess
+ *
+ * The previous implementation selected a row with an unordered `LIMIT 1` and then overwrote both its
+ * price and its roomType. A program carrying Quad/Triple/Double fares therefore had an arbitrary
+ * occupancy silently rewritten: the Double row could come back as a second "Quad" at the starting
+ * price, and the Double fare was gone. No failure was required — editing the title or the airline was
+ * enough, because the editor submitted its prefilled price on every save.
+ *
+ * The program write and the rate write are one transaction, and the rate count is read inside it, so
+ * a refusal rolls back rather than relying on being reached before the first write.
+ *
+ * Scope limit, as elsewhere: this does not serialise against a concurrent replaceUmrahRates.
+ */
 export async function saveAdminUmrahProgram(input: AdminUmrahInput) {
   const db = await getDb();
   if (!db) throw new Error("The Umrah service is unavailable.");
-  const patch = { slug: input.slug, titleEn: input.titleEn, titleAr: input.titleAr, departureAt: input.departureAt ?? null, returnAt: input.returnAt ?? null, durationDays: input.durationDays ?? null, airline: input.airline || null, makkahHotelEn: input.makkahHotelEn || null, makkahHotelAr: input.makkahHotelAr || null, madinahHotelEn: input.madinahHotelEn || null, madinahHotelAr: input.madinahHotelAr || null, availability: input.availability, isActive: input.isActive, lastUpdatedAt: new Date() };
-  const insertedProgram = input.id ? null : await db.insert(umrahPrograms).values(patch);
-  const id = input.id ?? Number((insertedProgram as unknown as Array<{ insertId: number }>)[0]?.insertId);
-  if (input.id) await db.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, input.id));
-  if (input.price) {
-    const existing = await db.select().from(umrahRateRows).where(eq(umrahRateRows.programId, id)).limit(1);
-    const ratePatch = { roomType: input.roomType || "Quad", price: input.price, currency: "EGP" };
-    if (existing[0]) await db.update(umrahRateRows).set(ratePatch).where(eq(umrahRateRows.id, existing[0].id));
-    else await db.insert(umrahRateRows).values({ programId: id, ...ratePatch });
-  }
-  return { id };
+
+  return db.transaction(async (tx) => {
+    // Counted inside the transaction so a refusal reflects the rows this write would act on, and
+    // targeted by explicit id afterwards rather than by an unordered LIMIT 1.
+    let existingRateIds: number[] = [];
+    if (input.id && input.price) {
+      const existingRates = await tx.select({ id: umrahRateRows.id }).from(umrahRateRows).where(eq(umrahRateRows.programId, input.id));
+      if (existingRates.length > 1) throw new Error(MULTI_RATE_UMRAH_PRICE_ERR_MSG);
+      existingRateIds = existingRates.map((rate) => rate.id);
+    }
+
+    const patch = { slug: input.slug, titleEn: input.titleEn, titleAr: input.titleAr, departureAt: input.departureAt ?? null, returnAt: input.returnAt ?? null, durationDays: input.durationDays ?? null, airline: input.airline || null, makkahHotelEn: input.makkahHotelEn || null, makkahHotelAr: input.makkahHotelAr || null, madinahHotelEn: input.madinahHotelEn || null, madinahHotelAr: input.madinahHotelAr || null, availability: input.availability, isActive: input.isActive, lastUpdatedAt: new Date() };
+    const insertedProgram = input.id ? null : await tx.insert(umrahPrograms).values(patch);
+    const id = input.id ?? Number((insertedProgram as unknown as Array<{ insertId: number }>)[0]?.insertId);
+    if (input.id) await tx.update(umrahPrograms).set(patch).where(eq(umrahPrograms.id, input.id));
+
+    if (input.price) {
+      const ratePatch = { roomType: input.roomType || "Quad", price: input.price, currency: "EGP" };
+      const targetRateId = existingRateIds[0];
+      if (targetRateId !== undefined) await tx.update(umrahRateRows).set(ratePatch).where(eq(umrahRateRows.id, targetRateId));
+      else await tx.insert(umrahRateRows).values({ programId: id, ...ratePatch });
+    }
+
+    return { id };
+  });
 }
 
 export async function updateUmrahStatus(id: number, patch: Pick<typeof umrahPrograms.$inferInsert, "isActive" | "availability">) {

@@ -6,11 +6,12 @@
  * names. Only messages the application itself defines are shown; everything else falls back to a
  * generic message.
  */
-import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG } from "@shared/const";
+import { MULTI_RATE_HEADLINE_PRICE_ERR_MSG, MULTI_RATE_UMRAH_PRICE_ERR_MSG } from "@shared/const";
 
 /** Business refusals that are safe and useful to show exactly as the server phrased them. */
 const KNOWN_OPERATOR_MESSAGES: ReadonlySet<string> = new Set([
   MULTI_RATE_HEADLINE_PRICE_ERR_MSG,
+  MULTI_RATE_UMRAH_PRICE_ERR_MSG,
 ]);
 
 function messageOf(error: unknown): string {

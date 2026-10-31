@@ -23,6 +23,7 @@
  * against a disposable schema, one at a time, the way the three executable tests below were.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { MULTI_RATE_UMRAH_PRICE_ERR_MSG } from "@shared/const";
 import {
   closeApplicationPool,
   importApplicationDb,
@@ -103,6 +104,7 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
   let saveAdminOffer: typeof import("./db")["saveAdminOffer"];
   let replaceOfferRates: typeof import("./db")["replaceOfferRates"];
   let replaceUmrahRates: typeof import("./db")["replaceUmrahRates"];
+  let saveAdminUmrahProgram: typeof import("./db")["saveAdminUmrahProgram"];
   let applicationDb: typeof import("./db");
 
   const baseInput = {
@@ -247,12 +249,22 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
     }
   }
 
+  async function seedSingleUmrahRate(programId: number): Promise<number> {
+    await database.query(
+      "INSERT INTO `umrahRateRows` (`programId`, `roomType`, `price`, `currency`, `notesEn`) VALUES (?, ?, ?, ?, ?)",
+      [programId, "Triple", "42000.00", "EGP", "Only occupancy"],
+    );
+    const rows = await umrahRateRowsFor(programId);
+    return Number(rows[0].id);
+  }
+
   beforeAll(async () => {
     database = await setupIntegrationDatabase();
     applicationDb = await importApplicationDb(database);
     saveAdminOffer = applicationDb.saveAdminOffer;
     replaceOfferRates = applicationDb.replaceOfferRates;
     replaceUmrahRates = applicationDb.replaceUmrahRates;
+    saveAdminUmrahProgram = applicationDb.saveAdminUmrahProgram;
   }, 60_000);
 
   afterAll(async () => {
@@ -350,5 +362,79 @@ describe.runIf(RUN_EXECUTABLE)("Finding 2 atomicity and D6 rate replacement [exe
     expect(await orderedUmrahRates(programId)).toEqual(ratesBefore);
     // lastUpdatedAt must not advance either: the program timestamp update is in the same transaction.
     expect(snapshot((await programRows())[0])).toEqual(programBefore);
+  });
+  it("Test D9-U — a multi-occupancy program refuses a starting price and changes nothing", async () => {
+    const programId = await seedUmrahProgram();
+    await seedUmrahRates(programId);
+
+    const ratesBefore = await orderedUmrahRates(programId);
+    const programBefore = snapshot((await programRows())[0]);
+    expect(ratesBefore).toHaveLength(3);
+
+    // Before D9-U this call picked a row with an unordered LIMIT 1 and overwrote its price AND its
+    // roomType, so a Double fare could come back as a second "Quad" at the starting price.
+    await expect(
+      saveAdminUmrahProgram({
+        slug: umrahSlug,
+        titleEn: "Ramadan Umrah",
+        titleAr: "عمرة رمضان",
+        availability: "limited",
+        isActive: true,
+        id: programId,
+        price: "39000",
+        roomType: "Quad",
+      }),
+    ).rejects.toThrow(MULTI_RATE_UMRAH_PRICE_ERR_MSG);
+
+    expect(await orderedUmrahRates(programId)).toEqual(ratesBefore);
+    expect(snapshot((await programRows())[0])).toEqual(programBefore);
+  });
+
+  it("Test D9-U — a content-only edit of a multi-occupancy program succeeds and touches no fare", async () => {
+    const programId = await seedUmrahProgram();
+    await seedUmrahRates(programId);
+    const ratesBefore = await orderedUmrahRates(programId);
+
+    await expect(
+      saveAdminUmrahProgram({
+        slug: umrahSlug,
+        titleEn: "Ramadan Umrah (revised)",
+        titleAr: "عمرة رمضان",
+        availability: "available",
+        isActive: true,
+        id: programId,
+        airline: "Saudia",
+      }),
+    ).resolves.toEqual({ id: programId });
+
+    // The ordinary edit that used to corrupt a fare now goes through untouched.
+    const program = (await programRows())[0];
+    expect(program.titleEn).toBe("Ramadan Umrah (revised)");
+    expect(program.airline).toBe("Saudia");
+    expect(await orderedUmrahRates(programId)).toEqual(ratesBefore);
+  });
+
+  it("Test D9-U — a single-occupancy program updates exactly that row, by id", async () => {
+    const programId = await seedUmrahProgram();
+    const rateId = await seedSingleUmrahRate(programId);
+
+    await expect(
+      saveAdminUmrahProgram({
+        slug: umrahSlug,
+        titleEn: "Ramadan Umrah",
+        titleAr: "عمرة رمضان",
+        availability: "limited",
+        isActive: true,
+        id: programId,
+        price: "44500",
+        roomType: "Triple",
+      }),
+    ).resolves.toEqual({ id: programId });
+
+    const rates = await umrahRateRowsFor(programId);
+    expect(rates).toHaveLength(1);
+    expect(Number(rates[0].id)).toBe(rateId);
+    expect(String(rates[0].price)).toBe("44500.00");
+    expect(rates[0].roomType).toBe("Triple");
   });
 });
